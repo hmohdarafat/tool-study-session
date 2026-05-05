@@ -3,7 +3,7 @@ use std::io::{self, Stdout, Write, stdout};
 use std::process::Command;
 use std::time::Duration;
 
-use chrono::{Local, Timelike};
+use chrono::{Datelike, Local, NaiveDate, Timelike};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
@@ -16,7 +16,6 @@ use crossterm::terminal::{
 use crossterm::{ExecutableCommand, QueueableCommand};
 
 const CLOCK_HEIGHT: u16 = 37;
-const CLOCK_PADDING_X: u16 = 2;
 const CELL_ASPECT_RATIO: f64 = 0.5;
 const HOUR_MARKER_SCALE: f64 = 0.8;
 const MINUTE_LABEL_SCALE: f64 = 0.6;
@@ -32,10 +31,20 @@ const MINUTE_HAND_COLOR: Color = Color::Green;
 const CENTER_COLOR: Color = Color::White;
 const CONTROL_COLOR: Color = Color::Blue;
 const FONT_INFO_COLOR: Color = Color::DarkCyan;
+const CALENDAR_HEADER_COLOR: Color = Color::Magenta;
+const CALENDAR_YEAR_COLOR: Color = Color::Cyan;
+const CALENDAR_WEEKDAY_COLOR: Color = Color::Blue;
+const CALENDAR_DAY_COLOR: Color = Color::Green;
+const CALENDAR_WEEKEND_COLOR: Color = Color::Red;
+const CALENDAR_CURRENT_DAY_COLOR: Color = Color::White;
+const CALENDAR_CURRENT_DAY_BG: Color = Color::DarkBlue;
+const PANEL_GAP: u16 = 4;
 
 struct AppState {
     font: FontSetting,
     original_font: FontSetting,
+    calendar_year: i32,
+    calendar_month: u32,
 }
 
 #[derive(Clone)]
@@ -51,10 +60,28 @@ struct FontButtons {
     y: u16,
 }
 
+struct CalendarButtons {
+    month_prev_x: u16,
+    month_prev_end: u16,
+    month_next_x: u16,
+    month_next_end: u16,
+    year_prev_x: u16,
+    year_prev_end: u16,
+    year_next_x: u16,
+    year_next_end: u16,
+    y: u16,
+}
+
+struct UiControls {
+    font: FontButtons,
+    calendar: CalendarButtons,
+}
+
 #[derive(Clone, Copy)]
 struct Cell {
     ch: char,
-    color: Option<Color>,
+    fg: Option<Color>,
+    bg: Option<Color>,
 }
 
 fn main() -> io::Result<()> {
@@ -64,9 +91,12 @@ fn main() -> io::Result<()> {
         family: "Ubuntu Sans Mono".to_string(),
         size: 13,
     });
+    let today = Local::now().date_naive();
     let mut state = AppState {
         font: initial_font.clone(),
         original_font: initial_font,
+        calendar_year: today.year(),
+        calendar_month: today.month(),
     };
 
     enable_raw_mode()?;
@@ -87,23 +117,57 @@ fn main() -> io::Result<()> {
 
 fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     loop {
-        let buttons = render(stdout, state)?;
+        let controls = render(stdout, state)?;
 
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('-') => adjust_font_size(state, -1)?,
-                    KeyCode::Char('+') | KeyCode::Char('=') => adjust_font_size(state, 1)?,
+                    KeyCode::Char('-') => {
+                        adjust_font_size(state, -1)?;
+                        render(stdout, state)?;
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        adjust_font_size(state, 1)?;
+                        render(stdout, state)?;
+                    }
                     _ => {}
                 },
                 Event::Mouse(mouse) => {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        if mouse.row == buttons.y {
-                            if (buttons.minus_x..buttons.minus_x + 3).contains(&mouse.column) {
+                        if mouse.row == controls.font.y {
+                            if (controls.font.minus_x..controls.font.minus_x + 3)
+                                .contains(&mouse.column)
+                            {
                                 adjust_font_size(state, -1)?;
-                            } else if (buttons.plus_x..buttons.plus_x + 3).contains(&mouse.column) {
+                                render(stdout, state)?;
+                            } else if (controls.font.plus_x..controls.font.plus_x + 3)
+                                .contains(&mouse.column)
+                            {
                                 adjust_font_size(state, 1)?;
+                                render(stdout, state)?;
+                            }
+                        }
+                        if mouse.row == controls.calendar.y {
+                            if (controls.calendar.month_prev_x..controls.calendar.month_prev_end)
+                                .contains(&mouse.column)
+                            {
+                                shift_month(state, -1);
+                            } else if (controls.calendar.month_next_x
+                                ..controls.calendar.month_next_end)
+                                .contains(&mouse.column)
+                            {
+                                shift_month(state, 1);
+                            } else if (controls.calendar.year_prev_x
+                                ..controls.calendar.year_prev_end)
+                                .contains(&mouse.column)
+                            {
+                                state.calendar_year -= 1;
+                            } else if (controls.calendar.year_next_x
+                                ..controls.calendar.year_next_end)
+                                .contains(&mouse.column)
+                            {
+                                state.calendar_year += 1;
                             }
                         }
                     }
@@ -116,53 +180,148 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     Ok(())
 }
 
-fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<FontButtons> {
+fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     let (width, height) = terminal::size()?;
-    let frame = build_clock(width, height);
-    let frame_width = frame.first().map(|line| line.len() as u16).unwrap_or(0);
-    let origin_x = width.saturating_sub(frame_width + CLOCK_PADDING_X);
+    let calendar = build_calendar(state.calendar_year, state.calendar_month);
+    let calendar_width = calendar.first().map(|line| line.len() as u16).unwrap_or(0);
+    let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
+    let clock = build_clock(available_clock_width, height);
+    let clock_width = clock.first().map(|line| line.len() as u16).unwrap_or(0);
+    let total_width = calendar_width + PANEL_GAP + clock_width;
+    let calendar_x = width.saturating_sub(total_width);
+    let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
-    let buttons = FontButtons {
+    let font_buttons = FontButtons {
         minus_x: 0,
         plus_x: 4,
         y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
     };
+    let calendar_buttons =
+        build_calendar_buttons(state.calendar_year, state.calendar_month, calendar_x);
 
     stdout.queue(Clear(ClearType::All))?;
 
-    for (row, line) in frame.iter().enumerate() {
+    for (row, line) in calendar.iter().enumerate() {
         let y = origin_y.saturating_add(row as u16);
         if y >= height {
             break;
         }
 
-        stdout.queue(MoveTo(origin_x, y))?;
-        let mut active_color = None;
-        for cell in line {
-            if cell.color != active_color {
-                match cell.color {
-                    Some(color) => stdout.queue(SetForegroundColor(color))?,
-                    None => stdout.queue(ResetColor)?,
-                };
-                active_color = cell.color;
-            }
-            stdout.queue(Print(cell.ch))?;
-        }
-        stdout.queue(ResetColor)?;
+        stdout.queue(MoveTo(calendar_x, y))?;
+        write_colored_line(stdout, line)?;
     }
 
-    stdout.queue(MoveTo(buttons.minus_x, buttons.y))?;
+    for (row, line) in clock.iter().enumerate() {
+        let y = origin_y.saturating_add(row as u16);
+        if y >= height {
+            break;
+        }
+
+        stdout.queue(MoveTo(clock_x, y))?;
+        write_colored_line(stdout, line)?;
+    }
+
+    stdout.queue(MoveTo(font_buttons.minus_x, font_buttons.y))?;
     stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
     stdout.queue(Print("[-]"))?;
-    stdout.queue(MoveTo(buttons.plus_x, buttons.y))?;
+    stdout.queue(MoveTo(font_buttons.plus_x, font_buttons.y))?;
     stdout.queue(Print("[+]"))?;
-    stdout.queue(MoveTo(8, buttons.y))?;
+    stdout.queue(MoveTo(8, font_buttons.y))?;
     stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
     stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
     stdout.queue(ResetColor)?;
 
     stdout.flush()?;
-    Ok(buttons)
+    Ok(UiControls {
+        font: font_buttons,
+        calendar: calendar_buttons,
+    })
+}
+
+fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
+    let mut active_fg = None;
+    let mut active_bg = None;
+    for cell in line {
+        if cell.fg != active_fg {
+            match cell.fg {
+                Some(color) => stdout.queue(SetForegroundColor(color))?,
+                None => stdout.queue(ResetColor)?,
+            };
+            active_fg = cell.fg;
+            active_bg = None;
+        }
+        if cell.bg != active_bg {
+            if let Some(color) = cell.bg {
+                stdout.queue(crossterm::style::SetBackgroundColor(color))?;
+            } else if active_fg.is_some() {
+                stdout.queue(crossterm::style::SetBackgroundColor(Color::Reset))?;
+            }
+            active_bg = cell.bg;
+        }
+        stdout.queue(Print(cell.ch))?;
+    }
+    stdout.queue(ResetColor)?;
+    stdout.queue(crossterm::style::SetBackgroundColor(Color::Reset))?;
+    Ok(())
+}
+
+fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
+    let width = 28usize;
+    let height = 10usize;
+    let mut grid = vec![vec![blank_cell(); width]; height];
+    let buttons = build_calendar_buttons(year, month, 0);
+    let month_name = month_name(month);
+    let title = format!("< {} >", month_name);
+    let year_text = format!("< {} >", year);
+
+    write_text(&mut grid, 0, 0, &title, CALENDAR_HEADER_COLOR, None);
+    write_text(
+        &mut grid,
+        buttons.year_prev_x as usize,
+        0,
+        &year_text,
+        CALENDAR_YEAR_COLOR,
+        None,
+    );
+
+    let weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    for (idx, day) in weekdays.iter().enumerate() {
+        let color = if is_weekend_column(idx) {
+            CALENDAR_WEEKEND_COLOR
+        } else {
+            CALENDAR_WEEKDAY_COLOR
+        };
+        write_text(&mut grid, idx * 4, 2, day, color, None);
+    }
+
+    let first_day = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let start_col = first_day.weekday().num_days_from_sunday() as usize;
+    let days_in_month = days_in_month(year, month);
+    let today = Local::now().date_naive();
+
+    for day in 1..=days_in_month {
+        let index = start_col + (day - 1) as usize;
+        let row = 4 + index / 7;
+        let col = (index % 7) * 4;
+        let color = if is_weekend_column(index % 7) {
+            CALENDAR_WEEKEND_COLOR
+        } else {
+            CALENDAR_DAY_COLOR
+        };
+        let bg = if today.year() == year && today.month() == month && today.day() == day {
+            Some(CALENDAR_CURRENT_DAY_BG)
+        } else {
+            None
+        };
+        let fg = if bg.is_some() {
+            CALENDAR_CURRENT_DAY_COLOR
+        } else {
+            color
+        };
+        write_text(&mut grid, col, row, &format!("{day:>2}"), fg, bg);
+    }
+
+    grid
 }
 
 fn build_clock(max_width: u16, max_height: u16) -> Vec<Vec<Cell>> {
@@ -353,7 +512,8 @@ fn place_text(
         {
             grid[y as usize][px as usize] = Cell {
                 ch,
-                color: Some(color),
+                fg: Some(color),
+                bg: None,
             };
         }
     }
@@ -431,7 +591,8 @@ fn plot_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char, colo
     if y < grid.len() && x < grid[y].len() && grid[y][x].ch == ' ' {
         grid[y][x] = Cell {
             ch: glyph,
-            color: Some(color),
+            fg: Some(color),
+            bg: None,
         };
     }
 }
@@ -476,7 +637,8 @@ fn overwrite_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char,
     if y < grid.len() && x < grid[y].len() {
         grid[y][x] = Cell {
             ch: glyph,
-            color: Some(color),
+            fg: Some(color),
+            bg: None,
         };
     }
 }
@@ -487,7 +649,8 @@ fn draw_center(grid: &mut [Vec<Cell>], center_x: f64, center_y: f64) {
     if y < grid.len() && x < grid[y].len() {
         grid[y][x] = Cell {
             ch: '+',
-            color: Some(CENTER_COLOR),
+            fg: Some(CENTER_COLOR),
+            bg: None,
         };
     }
 }
@@ -509,8 +672,93 @@ fn polar_to_grid(
 fn blank_cell() -> Cell {
     Cell {
         ch: ' ',
-        color: None,
+        fg: None,
+        bg: None,
     }
+}
+
+fn write_text(
+    grid: &mut [Vec<Cell>],
+    x: usize,
+    y: usize,
+    text: &str,
+    fg: Color,
+    bg: Option<Color>,
+) {
+    if y >= grid.len() {
+        return;
+    }
+    for (idx, ch) in text.chars().enumerate() {
+        let px = x + idx;
+        if px < grid[y].len() {
+            grid[y][px] = Cell {
+                ch,
+                fg: Some(fg),
+                bg,
+            };
+        }
+    }
+}
+
+fn build_calendar_buttons(year: i32, month: u32, calendar_x: u16) -> CalendarButtons {
+    let month_title = format!("< {} >", month_name(month));
+    let year_title = format!("< {} >", year);
+    let year_x = 14u16;
+    CalendarButtons {
+        month_prev_x: calendar_x,
+        month_prev_end: calendar_x + 1,
+        month_next_x: calendar_x + month_title.len() as u16 - 1,
+        month_next_end: calendar_x + month_title.len() as u16,
+        year_prev_x: calendar_x + year_x,
+        year_prev_end: calendar_x + year_x + 1,
+        year_next_x: calendar_x + year_x + year_title.len() as u16 - 1,
+        year_next_end: calendar_x + year_x + year_title.len() as u16,
+        y: 0,
+    }
+}
+
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        _ => "December",
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+    };
+    (next - chrono::Days::new(1)).day()
+}
+
+fn shift_month(state: &mut AppState, delta: i32) {
+    let mut month = state.calendar_month as i32 + delta;
+    let mut year = state.calendar_year;
+    if month < 1 {
+        month = 12;
+        year -= 1;
+    } else if month > 12 {
+        month = 1;
+        year += 1;
+    }
+    state.calendar_month = month as u32;
+    state.calendar_year = year;
+}
+
+fn is_weekend_column(column: usize) -> bool {
+    matches!(column, 5 | 6)
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
