@@ -27,8 +27,10 @@ const MIN_FONT_SIZE: i32 = 6;
 
 struct AppState {
     font: FontSetting,
+    original_font: FontSetting,
 }
 
+#[derive(Clone)]
 struct FontSetting {
     schema: String,
     family: String,
@@ -43,12 +45,14 @@ struct FontButtons {
 
 fn main() -> io::Result<()> {
     let mut stdout = stdout();
+    let initial_font = current_font_setting().unwrap_or(FontSetting {
+        schema: "org.gnome.desktop.interface".to_string(),
+        family: "Ubuntu Sans Mono".to_string(),
+        size: 13,
+    });
     let mut state = AppState {
-        font: current_font_setting().unwrap_or(FontSetting {
-            schema: "org.gnome.desktop.interface".to_string(),
-            family: "Ubuntu Sans Mono".to_string(),
-            size: 13,
-        }),
+        font: initial_font.clone(),
+        original_font: initial_font,
     };
 
     enable_raw_mode()?;
@@ -57,12 +61,14 @@ fn main() -> io::Result<()> {
     stdout.execute(EnableMouseCapture)?;
 
     let result = run(&mut stdout, &mut state);
+    let restore_result = restore_font_setting(&state.original_font);
 
     disable_raw_mode()?;
     stdout.execute(DisableMouseCapture)?;
     stdout.execute(Show)?;
     stdout.execute(LeaveAlternateScreen)?;
-    result
+    result?;
+    restore_result
 }
 
 fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
@@ -477,8 +483,28 @@ fn adjust_font_size(state: &mut AppState, delta: i32) -> io::Result<()> {
         return Ok(());
     }
 
-    let value = format!("{} {}", state.font.family, next_size);
-    let status = if state.font.schema == "org.gnome.desktop.interface" {
+    let mut next_font = state.font.clone();
+    next_font.size = next_size;
+
+    if apply_font_setting(&next_font)?.success() {
+        state.font.size = next_size;
+        Ok(())
+    } else {
+        Err(io::Error::other("failed to update gsettings font size"))
+    }
+}
+
+fn restore_font_setting(font: &FontSetting) -> io::Result<()> {
+    if apply_font_setting(font)?.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("failed to restore gsettings font size"))
+    }
+}
+
+fn apply_font_setting(font: &FontSetting) -> io::Result<std::process::ExitStatus> {
+    let value = format!("{} {}", font.family, font.size);
+    if font.schema == "org.gnome.desktop.interface" {
         Command::new("gsettings")
             .args([
                 "set",
@@ -486,18 +512,11 @@ fn adjust_font_size(state: &mut AppState, delta: i32) -> io::Result<()> {
                 "monospace-font-name",
                 &value,
             ])
-            .status()?
+            .status()
     } else {
         Command::new("gsettings")
-            .args(["set", &state.font.schema, "font", &value])
-            .status()?
-    };
-
-    if status.success() {
-        state.font.size = next_size;
-        Ok(())
-    } else {
-        Err(io::Error::other("failed to update gsettings font size"))
+            .args(["set", &font.schema, "font", &value])
+            .status()
     }
 }
 
