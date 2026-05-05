@@ -1,10 +1,13 @@
 use std::f64::consts::PI;
 use std::io::{self, Stdout, Write, stdout};
+use std::process::Command;
 use std::time::Duration;
 
 use chrono::{Local, Timelike};
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+};
 use crossterm::style::Print;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -12,38 +15,80 @@ use crossterm::terminal::{
 };
 use crossterm::{ExecutableCommand, QueueableCommand};
 
-const CLOCK_HEIGHT: u16 = 41;
+const CLOCK_HEIGHT: u16 = 37;
 const CLOCK_PADDING_X: u16 = 2;
-const CLOCK_PADDING_Y: u16 = 1;
 const CELL_ASPECT_RATIO: f64 = 0.5;
-const HOUR_MARKER_SCALE: f64 = 0.78;
-const MINUTE_LABEL_SCALE: f64 = 0.54;
-const MINUTE_DOT_SCALE: f64 = 0.64;
+const HOUR_MARKER_SCALE: f64 = 0.8;
+const MINUTE_LABEL_SCALE: f64 = 0.6;
+const MINUTE_DOT_SCALE: f64 = 0.72;
+const MINUTE_HAND_SCALE: f64 = MINUTE_DOT_SCALE;
+const FONT_BUTTON_Y_PADDING: u16 = 1;
+const MIN_FONT_SIZE: i32 = 6;
+
+struct AppState {
+    font: FontSetting,
+}
+
+struct FontSetting {
+    schema: String,
+    family: String,
+    size: i32,
+}
+
+struct FontButtons {
+    minus_x: u16,
+    plus_x: u16,
+    y: u16,
+}
 
 fn main() -> io::Result<()> {
     let mut stdout = stdout();
+    let mut state = AppState {
+        font: current_font_setting().unwrap_or(FontSetting {
+            schema: "org.gnome.desktop.interface".to_string(),
+            family: "Ubuntu Sans Mono".to_string(),
+            size: 13,
+        }),
+    };
+
     enable_raw_mode()?;
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(Hide)?;
+    stdout.execute(EnableMouseCapture)?;
 
-    let result = run(&mut stdout);
+    let result = run(&mut stdout, &mut state);
 
     disable_raw_mode()?;
+    stdout.execute(DisableMouseCapture)?;
     stdout.execute(Show)?;
     stdout.execute(LeaveAlternateScreen)?;
     result
 }
 
-fn run(stdout: &mut Stdout) -> io::Result<()> {
+fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     loop {
-        render(stdout)?;
+        let buttons = render(stdout, state)?;
 
         if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
+            match event::read()? {
+                Event::Key(key) => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('-') => adjust_font_size(state, -1)?,
+                    KeyCode::Char('+') | KeyCode::Char('=') => adjust_font_size(state, 1)?,
                     _ => {}
+                },
+                Event::Mouse(mouse) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        if mouse.row == buttons.y {
+                            if (buttons.minus_x..buttons.minus_x + 3).contains(&mouse.column) {
+                                adjust_font_size(state, -1)?;
+                            } else if (buttons.plus_x..buttons.plus_x + 3).contains(&mouse.column) {
+                                adjust_font_size(state, 1)?;
+                            }
+                        }
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -51,18 +96,19 @@ fn run(stdout: &mut Stdout) -> io::Result<()> {
     Ok(())
 }
 
-fn render(stdout: &mut Stdout) -> io::Result<()> {
+fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<FontButtons> {
     let (width, height) = terminal::size()?;
-    let frame = build_clock(width, height.saturating_sub(CLOCK_PADDING_Y));
+    let frame = build_clock(width, height);
     let frame_width = frame.first().map(|line| line.len() as u16).unwrap_or(0);
     let origin_x = width.saturating_sub(frame_width + CLOCK_PADDING_X);
-    let origin_y = CLOCK_PADDING_Y.min(height.saturating_sub(1));
+    let origin_y: u16 = 0;
+    let buttons = FontButtons {
+        minus_x: 0,
+        plus_x: 4,
+        y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
+    };
 
     stdout.queue(Clear(ClearType::All))?;
-    stdout.queue(MoveTo(0, 0))?;
-    stdout.queue(Print("Analog clock demo"))?;
-    stdout.queue(MoveTo(0, 1))?;
-    stdout.queue(Print("Press q or Esc to quit"))?;
 
     for (row, line) in frame.iter().enumerate() {
         let y = origin_y.saturating_add(row as u16);
@@ -74,7 +120,15 @@ fn render(stdout: &mut Stdout) -> io::Result<()> {
         stdout.queue(Print(line.as_str()))?;
     }
 
-    stdout.flush()
+    stdout.queue(MoveTo(buttons.minus_x, buttons.y))?;
+    stdout.queue(Print("[-]"))?;
+    stdout.queue(MoveTo(buttons.plus_x, buttons.y))?;
+    stdout.queue(Print("[+]"))?;
+    stdout.queue(MoveTo(8, buttons.y))?;
+    stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
+
+    stdout.flush()?;
+    Ok(buttons)
 }
 
 fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
@@ -85,18 +139,6 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
     let radius = center_y.min(center_x * CELL_ASPECT_RATIO);
     let radius_x = radius / CELL_ASPECT_RATIO;
     let radius_y = radius;
-
-    for y in 0..height {
-        for x in 0..width {
-            let dx = ((x as f64 - center_x) * CELL_ASPECT_RATIO) / radius;
-            let dy = (y as f64 - center_y) / radius;
-            let distance = (dx * dx + dy * dy).sqrt();
-
-            if (distance - 1.0).abs() <= 0.06 {
-                grid[y][x] = '.';
-            }
-        }
-    }
 
     place_minute_ticks(
         &mut grid,
@@ -132,7 +174,13 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
     let minute_angle = minute / 60.0 * 2.0 * PI;
 
     draw_hand(
-        &mut grid, center_x, center_y, radius_x, radius_y, hour_angle, 0.7,
+        &mut grid,
+        center_x,
+        center_y,
+        radius_x,
+        radius_y,
+        hour_angle,
+        HOUR_MARKER_SCALE,
     );
     draw_hand(
         &mut grid,
@@ -141,7 +189,7 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
         radius_x,
         radius_y,
         minute_angle,
-        minute_hand_scale(),
+        MINUTE_HAND_SCALE,
     );
     draw_center(&mut grid, center_x, center_y);
 
@@ -231,10 +279,6 @@ fn place_minute_ticks(
     }
 }
 
-fn minute_hand_scale() -> f64 {
-    MINUTE_DOT_SCALE
-}
-
 fn minute_tick_glyph(_minute: u32) -> char {
     '.'
 }
@@ -275,10 +319,29 @@ fn draw_hand(
     let start_x = center_x.round() as isize;
     let start_y = center_y.round() as isize;
     let (tip_x, tip_y) = polar_to_grid(center_x, center_y, radius_x, radius_y, scale, angle);
+    let is_minute_hand = (scale - MINUTE_HAND_SCALE).abs() < f64::EPSILON;
     let tip = hand_tip_glyph(angle);
-    let body = hand_body_glyph(angle);
+    let body = if is_minute_hand {
+        '-'
+    } else {
+        hand_body_glyph(angle)
+    };
+    let body_scale = if is_minute_hand {
+        (scale - 0.03).max(0.0)
+    } else {
+        scale
+    };
+    let (body_end_x, body_end_y) =
+        polar_to_grid(center_x, center_y, radius_x, radius_y, body_scale, angle);
 
-    draw_line(grid, start_x, start_y, tip_x as isize, tip_y as isize, body);
+    draw_line(
+        grid,
+        start_x,
+        start_y,
+        body_end_x as isize,
+        body_end_y as isize,
+        body,
+    );
     overwrite_hand_point(grid, tip_x, tip_y, tip);
 }
 
@@ -373,4 +436,85 @@ fn polar_to_grid(
     let x = center_x + radius_x * scale * adjusted.cos();
     let y = center_y + radius_y * scale * adjusted.sin();
     (x.round().max(0.0) as usize, y.round().max(0.0) as usize)
+}
+
+fn current_font_setting() -> io::Result<FontSetting> {
+    if let Some(profile_schema) = current_terminal_profile_schema()? {
+        let output = Command::new("gsettings")
+            .args(["get", &profile_schema, "font"])
+            .output()?;
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(mut setting) = parse_font_setting(&raw) {
+            setting.schema = profile_schema;
+            return Ok(setting);
+        }
+    }
+
+    let output = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "monospace-font-name"])
+        .output()?;
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut setting = parse_font_setting(&raw).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "unable to parse font setting")
+    })?;
+    setting.schema = "org.gnome.desktop.interface".to_string();
+    Ok(setting)
+}
+
+fn parse_font_setting(raw: &str) -> Option<FontSetting> {
+    let trimmed = raw.trim().trim_matches('\'');
+    let (family, size) = trimmed.rsplit_once(' ')?;
+    Some(FontSetting {
+        schema: String::new(),
+        family: family.to_string(),
+        size: size.parse().ok()?,
+    })
+}
+
+fn adjust_font_size(state: &mut AppState, delta: i32) -> io::Result<()> {
+    let next_size = (state.font.size + delta).max(MIN_FONT_SIZE);
+    if next_size == state.font.size {
+        return Ok(());
+    }
+
+    let value = format!("{} {}", state.font.family, next_size);
+    let status = if state.font.schema == "org.gnome.desktop.interface" {
+        Command::new("gsettings")
+            .args([
+                "set",
+                "org.gnome.desktop.interface",
+                "monospace-font-name",
+                &value,
+            ])
+            .status()?
+    } else {
+        Command::new("gsettings")
+            .args(["set", &state.font.schema, "font", &value])
+            .status()?
+    };
+
+    if status.success() {
+        state.font.size = next_size;
+        Ok(())
+    } else {
+        Err(io::Error::other("failed to update gsettings font size"))
+    }
+}
+
+fn current_terminal_profile_schema() -> io::Result<Option<String>> {
+    let output = Command::new("gsettings")
+        .args(["get", "org.gnome.Terminal.ProfilesList", "default"])
+        .output()?;
+    let profile_id = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('\'')
+        .to_string();
+
+    if profile_id.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{profile_id}/"
+    )))
 }
