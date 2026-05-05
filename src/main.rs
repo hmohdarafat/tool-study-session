@@ -8,7 +8,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
-use crossterm::style::Print;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode,
@@ -24,6 +24,14 @@ const MINUTE_DOT_SCALE: f64 = 0.72;
 const MINUTE_HAND_SCALE: f64 = MINUTE_DOT_SCALE;
 const FONT_BUTTON_Y_PADDING: u16 = 1;
 const MIN_FONT_SIZE: i32 = 6;
+const HOUR_LABEL_COLOR: Color = Color::Cyan;
+const MINUTE_LABEL_COLOR: Color = Color::Yellow;
+const MINUTE_TICK_COLOR: Color = Color::DarkYellow;
+const HOUR_HAND_COLOR: Color = Color::Magenta;
+const MINUTE_HAND_COLOR: Color = Color::Green;
+const CENTER_COLOR: Color = Color::White;
+const CONTROL_COLOR: Color = Color::Blue;
+const FONT_INFO_COLOR: Color = Color::DarkCyan;
 
 struct AppState {
     font: FontSetting,
@@ -41,6 +49,12 @@ struct FontButtons {
     minus_x: u16,
     plus_x: u16,
     y: u16,
+}
+
+#[derive(Clone, Copy)]
+struct Cell {
+    ch: char,
+    color: Option<Color>,
 }
 
 fn main() -> io::Result<()> {
@@ -123,23 +137,37 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<FontButtons> {
         }
 
         stdout.queue(MoveTo(origin_x, y))?;
-        stdout.queue(Print(line.as_str()))?;
+        let mut active_color = None;
+        for cell in line {
+            if cell.color != active_color {
+                match cell.color {
+                    Some(color) => stdout.queue(SetForegroundColor(color))?,
+                    None => stdout.queue(ResetColor)?,
+                };
+                active_color = cell.color;
+            }
+            stdout.queue(Print(cell.ch))?;
+        }
+        stdout.queue(ResetColor)?;
     }
 
     stdout.queue(MoveTo(buttons.minus_x, buttons.y))?;
+    stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
     stdout.queue(Print("[-]"))?;
     stdout.queue(MoveTo(buttons.plus_x, buttons.y))?;
     stdout.queue(Print("[+]"))?;
     stdout.queue(MoveTo(8, buttons.y))?;
+    stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
     stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
+    stdout.queue(ResetColor)?;
 
     stdout.flush()?;
     Ok(buttons)
 }
 
-fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
+fn build_clock(max_width: u16, max_height: u16) -> Vec<Vec<Cell>> {
     let (width, height) = clock_dimensions(max_width, max_height);
-    let mut grid = vec![vec![' '; width]; height];
+    let mut grid = vec![vec![blank_cell(); width]; height];
     let center_x = (width as f64 - 1.0) / 2.0;
     let center_y = (height as f64 - 1.0) / 2.0;
     let radius = center_y.min(center_x * CELL_ASPECT_RATIO);
@@ -199,9 +227,7 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<String> {
     );
     draw_center(&mut grid, center_x, center_y);
 
-    grid.into_iter()
-        .map(|row| row.into_iter().collect::<String>())
-        .collect()
+    grid
 }
 
 fn clock_dimensions(max_width: u16, max_height: u16) -> (usize, usize) {
@@ -233,7 +259,7 @@ fn make_odd(value: u16) -> u16 {
 }
 
 fn place_hour_labels(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -244,13 +270,21 @@ fn place_hour_labels(
         let angle = hour as f64 / 12.0 * 2.0 * PI;
         let label = hour.to_string();
         place_text(
-            grid, center_x, center_y, radius_x, radius_y, scale, angle, &label,
+            grid,
+            center_x,
+            center_y,
+            radius_x,
+            radius_y,
+            scale,
+            angle,
+            &label,
+            HOUR_LABEL_COLOR,
         );
     }
 }
 
 fn place_minute_labels(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -261,13 +295,21 @@ fn place_minute_labels(
         let angle = minute as f64 / 60.0 * 2.0 * PI;
         let label = minute.to_string();
         place_text(
-            grid, center_x, center_y, radius_x, radius_y, scale, angle, &label,
+            grid,
+            center_x,
+            center_y,
+            radius_x,
+            radius_y,
+            scale,
+            angle,
+            &label,
+            MINUTE_LABEL_COLOR,
         );
     }
 }
 
 fn place_minute_ticks(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -281,7 +323,7 @@ fn place_minute_ticks(
 
         let angle = minute as f64 / 60.0 * 2.0 * PI;
         let (x, y) = polar_to_grid(center_x, center_y, radius_x, radius_y, scale, angle);
-        plot_hand_point(grid, x, y, minute_tick_glyph(minute));
+        plot_hand_point(grid, x, y, minute_tick_glyph(minute), MINUTE_TICK_COLOR);
     }
 }
 
@@ -290,7 +332,7 @@ fn minute_tick_glyph(_minute: u32) -> char {
 }
 
 fn place_text(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -298,6 +340,7 @@ fn place_text(
     scale: f64,
     angle: f64,
     text: &str,
+    color: Color,
 ) {
     let (x, y) = polar_to_grid(center_x, center_y, radius_x, radius_y, scale, angle);
     let text_len = text.chars().count() as isize;
@@ -308,13 +351,16 @@ fn place_text(
         let px = start_x + idx as isize;
         if y >= 0 && (y as usize) < grid.len() && px >= 0 && (px as usize) < grid[y as usize].len()
         {
-            grid[y as usize][px as usize] = ch;
+            grid[y as usize][px as usize] = Cell {
+                ch,
+                color: Some(color),
+            };
         }
     }
 }
 
 fn draw_hand(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -332,6 +378,11 @@ fn draw_hand(
     } else {
         hand_body_glyph(angle)
     };
+    let color = if is_minute_hand {
+        MINUTE_HAND_COLOR
+    } else {
+        HOUR_HAND_COLOR
+    };
     let body_scale = if is_minute_hand {
         (scale - 0.03).max(0.0)
     } else {
@@ -347,8 +398,9 @@ fn draw_hand(
         body_end_x as isize,
         body_end_y as isize,
         body,
+        color,
     );
-    overwrite_hand_point(grid, tip_x, tip_y, tip);
+    overwrite_hand_point(grid, tip_x, tip_y, tip, color);
 }
 
 fn hand_tip_glyph(angle: f64) -> char {
@@ -375,19 +427,23 @@ fn hand_body_glyph(angle: f64) -> char {
     }
 }
 
-fn plot_hand_point(grid: &mut [Vec<char>], x: usize, y: usize, glyph: char) {
-    if y < grid.len() && x < grid[y].len() && grid[y][x] == ' ' {
-        grid[y][x] = glyph;
+fn plot_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char, color: Color) {
+    if y < grid.len() && x < grid[y].len() && grid[y][x].ch == ' ' {
+        grid[y][x] = Cell {
+            ch: glyph,
+            color: Some(color),
+        };
     }
 }
 
 fn draw_line(
-    grid: &mut [Vec<char>],
+    grid: &mut [Vec<Cell>],
     mut x0: isize,
     mut y0: isize,
     x1: isize,
     y1: isize,
     glyph: char,
+    color: Color,
 ) {
     let dx = (x1 - x0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -397,7 +453,7 @@ fn draw_line(
 
     loop {
         if x0 >= 0 && y0 >= 0 {
-            plot_hand_point(grid, x0 as usize, y0 as usize, glyph);
+            plot_hand_point(grid, x0 as usize, y0 as usize, glyph, color);
         }
 
         if x0 == x1 && y0 == y1 {
@@ -416,17 +472,23 @@ fn draw_line(
     }
 }
 
-fn overwrite_hand_point(grid: &mut [Vec<char>], x: usize, y: usize, glyph: char) {
+fn overwrite_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char, color: Color) {
     if y < grid.len() && x < grid[y].len() {
-        grid[y][x] = glyph;
+        grid[y][x] = Cell {
+            ch: glyph,
+            color: Some(color),
+        };
     }
 }
 
-fn draw_center(grid: &mut [Vec<char>], center_x: f64, center_y: f64) {
+fn draw_center(grid: &mut [Vec<Cell>], center_x: f64, center_y: f64) {
     let x = center_x.round() as usize;
     let y = center_y.round() as usize;
     if y < grid.len() && x < grid[y].len() {
-        grid[y][x] = '+';
+        grid[y][x] = Cell {
+            ch: '+',
+            color: Some(CENTER_COLOR),
+        };
     }
 }
 
@@ -442,6 +504,13 @@ fn polar_to_grid(
     let x = center_x + radius_x * scale * adjusted.cos();
     let y = center_y + radius_y * scale * adjusted.sin();
     (x.round().max(0.0) as usize, y.round().max(0.0) as usize)
+}
+
+fn blank_cell() -> Cell {
+    Cell {
+        ch: ' ',
+        color: None,
+    }
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
