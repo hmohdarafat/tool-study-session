@@ -72,6 +72,7 @@ struct AppState {
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
     window_fitted: bool,
+    pending_height_fit: bool,
     quit_prompt: bool,
 }
 
@@ -213,6 +214,7 @@ fn main() -> io::Result<()> {
         todos: load_todos().unwrap_or_default(),
         editing_todo: None,
         window_fitted: false,
+        pending_height_fit: true,
         quit_prompt: false,
     };
 
@@ -321,6 +323,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         }) {
                             save_editing_todo(state);
                             state.selected_date = hit.date;
+                            state.pending_height_fit = true;
                         }
                         if mouse.row == controls.calendar.add_button.y
                             && (controls.calendar.add_button.x..controls.calendar.add_button.end_x)
@@ -341,6 +344,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                     done: false,
                                     is_placeholder: true,
                                 });
+                            state.pending_height_fit = true;
                         }
                         if let Some(hit) = controls.calendar.todo_deletes.iter().find(|hit| {
                             mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
@@ -351,6 +355,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                     items.remove(hit.index);
                                 }
                             }
+                            state.pending_height_fit = true;
                         }
                         if let Some(hit) = controls.calendar.todo_checks.iter().find(|hit| {
                             mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
@@ -437,9 +442,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         state.editing_todo.as_ref(),
         0,
     );
-    let required_height = (preview_calendar.grid.len() as u16).saturating_add(2);
-    if height < required_height {
-        request_terminal_size(stdout, width, required_height)?;
+    let minimum_height = (preview_calendar.grid.len() as u16).saturating_add(2);
+    if height < minimum_height {
+        request_terminal_size(stdout, width, minimum_height)?;
         let (new_width, new_height) = terminal::size()?;
         width = new_width;
         height = new_height;
@@ -470,9 +475,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     }
     let content_height = height.saturating_sub(2);
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-    let clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
-    let visible_clock_width = visible_grid_width(&clock);
-    let clock_height = clock.len() as u16;
+    let mut clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
+    let mut visible_clock_width = visible_grid_width(&clock);
+    let mut clock_height = clock.len() as u16;
     let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
@@ -487,6 +492,31 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
             + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
             + start_label.len() as u16,
         y: clock_height.min(content_height),
+    };
+    let desired_height = preview_calendar
+        .grid
+        .len()
+        .max((start_button.y as usize).saturating_add(1))
+        .saturating_add(1) as u16;
+    if state.pending_height_fit && height != desired_height {
+        request_terminal_size(stdout, width, desired_height)?;
+        let (new_width, new_height) = terminal::size()?;
+        width = new_width;
+        height = new_height;
+
+        let content_height = height.saturating_sub(2);
+        let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
+        clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
+        visible_clock_width = visible_grid_width(&clock);
+        clock_height = clock.len() as u16;
+    }
+    state.pending_height_fit = false;
+    let start_button = ActionButton {
+        x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
+        end_x: clock_x
+            + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
+            + start_label.len() as u16,
+        y: clock_height.min(height.saturating_sub(2)),
     };
     let font_buttons = FontButtons {
         minus_x: 0,
@@ -749,7 +779,6 @@ fn build_calendar_panel(
         .map(|items| {
             items
                 .iter()
-                .take(6)
                 .enumerate()
                 .map(|(index, item)| {
                     let display_text = if let Some(editing) = editing_todo {
@@ -881,7 +910,7 @@ fn build_calendar_panel(
 
     let mut current_row = todo_header_y + 2;
     if let Some(items) = todos {
-        for (index, item) in items.iter().take(6).enumerate() {
+        for (index, item) in items.iter().enumerate() {
             let delete_x = 0;
             let check_x = 2;
             let display_text = if let Some(editing) = editing_todo {
@@ -1542,6 +1571,7 @@ fn save_editing_todo(state: &mut AppState) {
                 item.text = editing.buffer;
                 item.is_placeholder = false;
             }
+            state.pending_height_fit = true;
         }
     }
 }
