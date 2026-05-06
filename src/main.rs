@@ -14,8 +14,7 @@ use crossterm::event::{
 };
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{
-    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{ExecutableCommand, QueueableCommand};
 use serde::{Deserialize, Serialize};
@@ -61,6 +60,7 @@ const TODO_SAVE_PATH: &str = "todos.json";
 const GRADIENT_SPEED: f64 = 45.0;
 const GRADIENT_X_SCALE: f64 = 0.18;
 const GRADIENT_Y_SCALE: f64 = 0.32;
+const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 struct AppState {
     font: FontSetting,
@@ -236,10 +236,9 @@ fn main() -> io::Result<()> {
 
 fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     let mut controls = render(stdout, state)?;
-    let mut last_rendered_minute = Local::now().minute();
 
     loop {
-        if event::poll(duration_until_next_minute())? {
+        if event::poll(gradient_poll_interval())? {
             match event::read()? {
                 Event::Key(key) => {
                     if state.quit_prompt {
@@ -412,11 +411,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                 _ => {}
             }
         } else {
-            let minute = Local::now().minute();
-            if minute != last_rendered_minute {
-                last_rendered_minute = minute;
-                controls = render(stdout, state)?;
-            }
+            controls = render(stdout, state)?;
         }
     }
 
@@ -429,6 +424,10 @@ fn duration_until_next_minute() -> Duration {
     let seconds_remaining = 59u64.saturating_sub(now.second() as u64);
     let total_millis = seconds_remaining * 1_000 + millis_until_next_second as u64;
     Duration::from_millis(total_millis.max(1))
+}
+
+fn gradient_poll_interval() -> Duration {
+    duration_until_next_minute().min(GRADIENT_REFRESH_INTERVAL)
 }
 
 fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
@@ -586,7 +585,6 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         false,
     );
 
-    stdout.queue(Clear(ClearType::All))?;
     for (row, line) in frame.iter().enumerate() {
         stdout.queue(MoveTo(0, row as u16))?;
         write_colored_line(stdout, line)?;
