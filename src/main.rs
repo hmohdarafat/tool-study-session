@@ -57,9 +57,9 @@ const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const TODO_SAVE_PATH: &str = "todos.json";
-const GRADIENT_SPEED: f64 = 45.0;
-const GRADIENT_X_SCALE: f64 = 0.18;
-const GRADIENT_Y_SCALE: f64 = 0.32;
+const GRADIENT_SPEED: f64 = 24.0;
+const GRADIENT_X_SCALE: f64 = 1.8;
+const GRADIENT_Y_SCALE: f64 = 1.4;
 const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 struct AppState {
@@ -725,15 +725,41 @@ fn gradient_color(x: usize, y: usize, width: usize, height: usize) -> Color {
         0.0
     };
 
-    let red = wave(phase + x_ratio * GRADIENT_X_SCALE + y_ratio * 0.08, 10.0, 42.0);
-    let green = wave(phase + y_ratio * GRADIENT_Y_SCALE + 0.33, 12.0, 36.0);
-    let blue = wave(phase + (x_ratio + y_ratio) * 0.22 + 0.66, 22.0, 64.0);
+    let field = soft_field(phase, x_ratio, y_ratio);
+    let drift = soft_field(phase + 0.19, y_ratio * 0.9 + 0.07, x_ratio * 0.8 + 0.11);
+    let shimmer = soft_field(
+        phase + 0.41,
+        x_ratio * 0.65 + 0.17,
+        y_ratio * 0.7 + pseudo_offset(x, y),
+    );
+    let bloom = soft_field(phase + 0.73, x_ratio * 0.55 + 0.31, y_ratio * 0.6 + 0.13);
+    let glow = soft_field(phase + 0.92, y_ratio * 0.5 + 0.29, x_ratio * 0.75 + 0.23);
+    let ember = soft_field(phase + 1.17, x_ratio * 0.48 + 0.43, y_ratio * 0.52 + 0.19);
+    let tide = soft_field(phase + 1.36, y_ratio * 0.62 + 0.37, x_ratio * 0.58 + 0.27);
+
+    let red = channel(field, bloom, ember, glow, 6.0, 34.0, 0.11);
+    let green = channel(drift, glow, tide, shimmer, 8.0, 30.0, 0.37);
+    let blue = channel(shimmer, tide, field, glow, 14.0, 44.0, 0.63);
 
     Color::Rgb { r: red, g: green, b: blue }
 }
 
-fn wave(position: f64, min: f64, amplitude: f64) -> u8 {
-    (min + amplitude * (0.5 + 0.5 * (position * 2.0 * PI).sin())).round() as u8
+fn soft_field(phase: f64, x_ratio: f64, y_ratio: f64) -> f64 {
+    let broad = ((x_ratio * GRADIENT_X_SCALE + phase) * 2.0 * PI).sin();
+    let tall = ((y_ratio * GRADIENT_Y_SCALE - phase * 0.7 + 0.23) * 2.0 * PI).sin();
+    let diagonal = (((x_ratio * 0.9 + y_ratio * 0.7) * 1.3 + phase * 0.5 + 0.41) * 2.0 * PI)
+        .sin();
+    0.45 * broad + 0.35 * tall + 0.20 * diagonal
+}
+
+fn pseudo_offset(x: usize, y: usize) -> f64 {
+    let seed = ((x as u64).wrapping_mul(73_856_093)) ^ ((y as u64).wrapping_mul(19_349_663));
+    (seed % 10_000) as f64 / 10_000.0 * 0.08
+}
+
+fn channel(a: f64, b: f64, c: f64, d: f64, base: f64, amplitude: f64, phase: f64) -> u8 {
+    let blend = 0.5 + 0.5 * (0.34 * a + 0.24 * b + 0.22 * c + 0.20 * d + phase).sin();
+    (base + amplitude * blend).round() as u8
 }
 
 fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
