@@ -230,10 +230,11 @@ fn main() -> io::Result<()> {
 }
 
 fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
-    loop {
-        let controls = render(stdout, state)?;
+    let mut controls = render(stdout, state)?;
+    let mut last_rendered_minute = Local::now().minute();
 
-        if event::poll(Duration::from_millis(250))? {
+    loop {
+        if event::poll(duration_until_next_minute())? {
             match event::read()? {
                 Event::Key(key) => {
                     if state.quit_prompt {
@@ -248,23 +249,24 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         }
                     }
                     if handle_editing_key(state, &key.code) {
+                        controls = render(stdout, state)?;
                         continue;
                     }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             save_editing_todo(state);
                             state.quit_prompt = true;
-                            render(stdout, state)?;
+                            controls = render(stdout, state)?;
                         }
                         KeyCode::Char('-') => {
                             save_editing_todo(state);
                             adjust_font_size(state, -1)?;
-                            render(stdout, state)?;
+                            controls = render(stdout, state)?;
                         }
                         KeyCode::Char('+') | KeyCode::Char('=') => {
                             save_editing_todo(state);
                             adjust_font_size(state, 1)?;
-                            render(stdout, state)?;
+                            controls = render(stdout, state)?;
                         }
                         _ => {}
                     }
@@ -281,12 +283,10 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 .contains(&mouse.column)
                             {
                                 adjust_font_size(state, -1)?;
-                                render(stdout, state)?;
                             } else if (controls.font.plus_x..controls.font.plus_x + 3)
                                 .contains(&mouse.column)
                             {
                                 adjust_font_size(state, 1)?;
-                                render(stdout, state)?;
                             }
                         }
                         if mouse.row == controls.calendar.buttons.y {
@@ -394,14 +394,33 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         if !keep_editing {
                             save_editing_todo(state);
                         }
+                        controls = render(stdout, state)?;
                     }
                 }
+                Event::Resize(_, _) => {
+                    state.window_fitted = true;
+                    controls = render(stdout, state)?;
+                }
                 _ => {}
+            }
+        } else {
+            let minute = Local::now().minute();
+            if minute != last_rendered_minute {
+                last_rendered_minute = minute;
+                controls = render(stdout, state)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn duration_until_next_minute() -> Duration {
+    let now = Local::now();
+    let millis_until_next_second = 1_000u32.saturating_sub(now.nanosecond() / 1_000_000);
+    let seconds_remaining = 59u64.saturating_sub(now.second() as u64);
+    let total_millis = seconds_remaining * 1_000 + millis_until_next_second as u64;
+    Duration::from_millis(total_millis.max(1))
 }
 
 fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
