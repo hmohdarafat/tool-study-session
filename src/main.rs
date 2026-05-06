@@ -3,7 +3,7 @@ use std::io::{self, Stdout, Write, stdout};
 use std::process::Command;
 use std::time::Duration;
 
-use chrono::{Datelike, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
@@ -39,12 +39,16 @@ const CALENDAR_WEEKEND_COLOR: Color = Color::Red;
 const CALENDAR_CURRENT_DAY_COLOR: Color = Color::White;
 const CALENDAR_CURRENT_DAY_BG: Color = Color::DarkBlue;
 const PANEL_GAP: u16 = 4;
+const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
+const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
+const START_BUTTON_COLOR: Color = Color::Magenta;
 
 struct AppState {
     font: FontSetting,
     original_font: FontSetting,
     calendar_year: i32,
     calendar_month: u32,
+    pomodoro_start: Option<DateTime<Local>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +79,20 @@ struct CalendarButtons {
 struct UiControls {
     font: FontButtons,
     calendar: CalendarButtons,
+    start: ActionButton,
+}
+
+struct ActionButton {
+    x: u16,
+    end_x: u16,
+    y: u16,
+}
+
+enum PomodoroMarkerStyle {
+    Hidden,
+    Normal,
+    Work,
+    Break,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +115,7 @@ fn main() -> io::Result<()> {
         original_font: initial_font,
         calendar_year: today.year(),
         calendar_month: today.month(),
+        pomodoro_start: None,
     };
 
     enable_raw_mode()?;
@@ -170,6 +189,15 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 state.calendar_year += 1;
                             }
                         }
+                        if mouse.row == controls.start.y
+                            && (controls.start.x..controls.start.end_x).contains(&mouse.column)
+                        {
+                            state.pomodoro_start = if state.pomodoro_start.is_some() {
+                                None
+                            } else {
+                                Some(Local::now())
+                            };
+                        }
                     }
                 }
                 _ => {}
@@ -182,15 +210,29 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
 fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     let (width, height) = terminal::size()?;
+    let content_height = height.saturating_sub(2);
     let calendar = build_calendar(state.calendar_year, state.calendar_month);
     let calendar_width = calendar.first().map(|line| line.len() as u16).unwrap_or(0);
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-    let clock = build_clock(available_clock_width, height);
+    let clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
     let clock_width = clock.first().map(|line| line.len() as u16).unwrap_or(0);
+    let clock_height = clock.len() as u16;
     let total_width = calendar_width + PANEL_GAP + clock_width;
     let calendar_x = width.saturating_sub(total_width);
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
+    let start_label = if state.pomodoro_start.is_some() {
+        "[Stop]"
+    } else {
+        "[Start]"
+    };
+    let start_button = ActionButton {
+        x: clock_x + clock_width.saturating_sub(start_label.len() as u16) / 2,
+        end_x: clock_x
+            + clock_width.saturating_sub(start_label.len() as u16) / 2
+            + start_label.len() as u16,
+        y: clock_height.min(content_height),
+    };
     let font_buttons = FontButtons {
         minus_x: 0,
         plus_x: 4,
@@ -229,12 +271,16 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     stdout.queue(MoveTo(8, font_buttons.y))?;
     stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
     stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
+    stdout.queue(MoveTo(start_button.x, start_button.y))?;
+    stdout.queue(SetForegroundColor(START_BUTTON_COLOR))?;
+    stdout.queue(Print(start_label))?;
     stdout.queue(ResetColor)?;
 
     stdout.flush()?;
     Ok(UiControls {
         font: font_buttons,
         calendar: calendar_buttons,
+        start: start_button,
     })
 }
 
@@ -324,7 +370,11 @@ fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
     grid
 }
 
-fn build_clock(max_width: u16, max_height: u16) -> Vec<Vec<Cell>> {
+fn build_clock(
+    max_width: u16,
+    max_height: u16,
+    pomodoro_start: Option<DateTime<Local>>,
+) -> Vec<Vec<Cell>> {
     let (width, height) = clock_dimensions(max_width, max_height);
     let mut grid = vec![vec![blank_cell(); width]; height];
     let center_x = (width as f64 - 1.0) / 2.0;
@@ -340,6 +390,7 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<Vec<Cell>> {
         radius_x,
         radius_y,
         MINUTE_DOT_SCALE,
+        pomodoro_start,
     );
     place_hour_labels(
         &mut grid,
@@ -356,6 +407,7 @@ fn build_clock(max_width: u16, max_height: u16) -> Vec<Vec<Cell>> {
         radius_x,
         radius_y,
         MINUTE_LABEL_SCALE,
+        pomodoro_start,
     );
 
     let now = Local::now();
@@ -449,20 +501,18 @@ fn place_minute_labels(
     radius_x: f64,
     radius_y: f64,
     scale: f64,
+    pomodoro_start: Option<DateTime<Local>>,
 ) {
     for minute in (0..60).step_by(5) {
         let angle = minute as f64 / 60.0 * 2.0 * PI;
         let label = minute.to_string();
+        let style = pomodoro_marker_style(pomodoro_start, minute);
+        if matches!(style, PomodoroMarkerStyle::Hidden) {
+            continue;
+        }
+        let color = marker_style_color(style, MINUTE_LABEL_COLOR);
         place_text(
-            grid,
-            center_x,
-            center_y,
-            radius_x,
-            radius_y,
-            scale,
-            angle,
-            &label,
-            MINUTE_LABEL_COLOR,
+            grid, center_x, center_y, radius_x, radius_y, scale, angle, &label, color,
         );
     }
 }
@@ -474,15 +524,21 @@ fn place_minute_ticks(
     radius_x: f64,
     radius_y: f64,
     scale: f64,
+    pomodoro_start: Option<DateTime<Local>>,
 ) {
     for minute in 0..60 {
         if minute % 5 == 0 {
             continue;
         }
 
+        let style = pomodoro_marker_style(pomodoro_start, minute);
+        if matches!(style, PomodoroMarkerStyle::Hidden) {
+            continue;
+        }
         let angle = minute as f64 / 60.0 * 2.0 * PI;
+        let color = marker_style_color(style, MINUTE_TICK_COLOR);
         let (x, y) = polar_to_grid(center_x, center_y, radius_x, radius_y, scale, angle);
-        plot_hand_point(grid, x, y, minute_tick_glyph(minute), MINUTE_TICK_COLOR);
+        plot_hand_point(grid, x, y, minute_tick_glyph(minute), color);
     }
 }
 
@@ -674,6 +730,40 @@ fn blank_cell() -> Cell {
         ch: ' ',
         fg: None,
         bg: None,
+    }
+}
+
+fn pomodoro_marker_style(
+    pomodoro_start: Option<DateTime<Local>>,
+    minute_marker: u32,
+) -> PomodoroMarkerStyle {
+    let Some(start) = pomodoro_start else {
+        return PomodoroMarkerStyle::Normal;
+    };
+    let now = Local::now();
+    let elapsed = (now.signed_duration_since(start).num_minutes()).max(0) as u32;
+    if elapsed >= 60 {
+        return PomodoroMarkerStyle::Hidden;
+    }
+
+    let start_minute = start.minute();
+    let offset = (minute_marker + 60 - start_minute) % 60;
+
+    if offset < elapsed {
+        PomodoroMarkerStyle::Hidden
+    } else if offset < 50 {
+        PomodoroMarkerStyle::Work
+    } else {
+        PomodoroMarkerStyle::Break
+    }
+}
+
+fn marker_style_color(style: PomodoroMarkerStyle, normal: Color) -> Color {
+    match style {
+        PomodoroMarkerStyle::Normal => normal,
+        PomodoroMarkerStyle::Work => POMODORO_WORK_COLOR,
+        PomodoroMarkerStyle::Break => POMODORO_BREAK_COLOR,
+        PomodoroMarkerStyle::Hidden => normal,
     }
 }
 
