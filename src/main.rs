@@ -451,18 +451,28 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         .first()
         .map(|line| line.len() as u16)
         .unwrap_or(0);
-    let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-    let clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
-    let clock_width = clock.first().map(|line| line.len() as u16).unwrap_or(0);
-    let clock_height = clock.len() as u16;
-    let total_width = calendar_width + PANEL_GAP + clock_width;
+    let quit_hint = "q = quit";
+    let footer_width = quit_hint.len() as u16;
     if !state.window_fitted {
-        request_terminal_size(stdout, total_width, height)?;
+        let preferred_clock = build_clock(
+            preferred_width(make_odd(CLOCK_HEIGHT.min(content_height.max(11)))),
+            content_height,
+            state.pomodoro_start,
+        );
+        let preferred_content_width =
+            calendar_width + PANEL_GAP + visible_grid_width(&preferred_clock);
+        let preferred_total_width = preferred_content_width.max(footer_width);
+        request_terminal_size(stdout, preferred_total_width, height)?;
         let (new_width, new_height) = terminal::size()?;
         width = new_width;
         height = new_height;
         state.window_fitted = true;
     }
+    let content_height = height.saturating_sub(2);
+    let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
+    let clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
+    let visible_clock_width = visible_grid_width(&clock);
+    let clock_height = clock.len() as u16;
     let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
@@ -472,9 +482,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         "[Start]"
     };
     let start_button = ActionButton {
-        x: clock_x + clock_width.saturating_sub(start_label.len() as u16) / 2,
+        x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
         end_x: clock_x
-            + clock_width.saturating_sub(start_label.len() as u16) / 2
+            + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
             + start_label.len() as u16,
         y: clock_height.min(content_height),
     };
@@ -483,10 +493,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         plus_x: 4,
         y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
     };
-    let quit_hint = "q = quit";
-    let quit_hint_x = total_width
-        .saturating_sub(quit_hint.len() as u16)
-        .min(width.saturating_sub(quit_hint.len() as u16));
+    let quit_hint_x = width.saturating_sub(quit_hint.len() as u16);
     let quit_prompt = "Save todos before quitting? (y/n)";
     let calendar = build_calendar_panel(
         state.calendar_year,
@@ -568,6 +575,19 @@ fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Re
     stdout.flush()?;
     thread::sleep(Duration::from_millis(120));
     Ok(())
+}
+
+fn visible_grid_width(grid: &[Vec<Cell>]) -> u16 {
+    let mut max_width = 0usize;
+    for row in grid {
+        if let Some(last_used) = row
+            .iter()
+            .rposition(|cell| cell.ch != ' ' || cell.fg.is_some() || cell.bg.is_some())
+        {
+            max_width = max_width.max(last_used + 1);
+        }
+    }
+    max_width as u16
 }
 
 fn build_gradient_frame(width: usize, height: usize) -> Vec<Vec<Cell>> {
@@ -1592,6 +1612,7 @@ fn adjust_font_size(state: &mut AppState, delta: i32) -> io::Result<()> {
 
     if apply_font_setting(&next_font)?.success() {
         state.font.size = next_size;
+        state.window_fitted = false;
         Ok(())
     } else {
         Err(io::Error::other("failed to update gsettings font size"))
