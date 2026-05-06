@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 
 const CLOCK_HEIGHT: u16 = 37;
 const CELL_ASPECT_RATIO: f64 = 0.5;
-const HOUR_MARKER_SCALE: f64 = 0.8;
-const MINUTE_LABEL_SCALE: f64 = 0.6;
-const MINUTE_DOT_SCALE: f64 = 0.72;
+const HOUR_MARKER_SCALE: f64 = 0.96;
+const MINUTE_LABEL_SCALE: f64 = 0.78;
+const MINUTE_DOT_SCALE: f64 = 0.9;
 const MINUTE_HAND_SCALE: f64 = MINUTE_DOT_SCALE;
 const FONT_BUTTON_Y_PADDING: u16 = 1;
 const MIN_FONT_SIZE: i32 = 6;
@@ -52,7 +52,7 @@ const TODO_BOX_COLOR: Color = Color::Green;
 const TODO_ADD_BUTTON_COLOR: Color = Color::Blue;
 const TODO_DELETE_COLOR: Color = Color::Red;
 const TODO_EDIT_BG: Color = Color::DarkGrey;
-const PANEL_GAP: u16 = 4;
+const PANEL_GAP: u16 = 2;
 const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
 const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
@@ -590,6 +590,45 @@ fn visible_grid_width(grid: &[Vec<Cell>]) -> u16 {
     max_width as u16
 }
 
+fn trim_grid(grid: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+    if grid.is_empty() || grid[0].is_empty() {
+        return grid;
+    }
+
+    let mut min_x = usize::MAX;
+    let mut max_x = 0usize;
+    let mut min_y = usize::MAX;
+    let mut max_y = 0usize;
+    let mut found = false;
+
+    for (y, row) in grid.iter().enumerate() {
+        for (x, cell) in row.iter().enumerate() {
+            if cell.ch != ' ' || cell.fg.is_some() || cell.bg.is_some() {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+    }
+
+    if !found {
+        return grid;
+    }
+
+    grid.into_iter()
+        .skip(min_y)
+        .take(max_y - min_y + 1)
+        .map(|row| {
+            row.into_iter()
+                .skip(min_x)
+                .take(max_x - min_x + 1)
+                .collect()
+        })
+        .collect()
+}
+
 fn build_gradient_frame(width: usize, height: usize) -> Vec<Vec<Cell>> {
     (0..height)
         .map(|y| {
@@ -996,7 +1035,7 @@ fn build_clock(
     );
     draw_center(&mut grid, center_x, center_y);
 
-    grid
+    trim_grid(grid)
 }
 
 fn clock_dimensions(max_width: u16, max_height: u16) -> (usize, usize) {
