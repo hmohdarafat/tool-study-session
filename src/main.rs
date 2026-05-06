@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::fs;
 use std::io::{self, Stdout, Write, stdout};
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -16,6 +18,7 @@ use crossterm::terminal::{
     enable_raw_mode,
 };
 use crossterm::{ExecutableCommand, QueueableCommand};
+use serde::{Deserialize, Serialize};
 
 const CLOCK_HEIGHT: u16 = 37;
 const CELL_ASPECT_RATIO: f64 = 0.5;
@@ -41,6 +44,7 @@ const CALENDAR_CURRENT_DAY_COLOR: Color = Color::White;
 const CALENDAR_CURRENT_DAY_BG: Color = Color::DarkBlue;
 const CALENDAR_SELECTED_DAY_COLOR: Color = Color::Black;
 const CALENDAR_SELECTED_DAY_BG: Color = Color::Cyan;
+const CALENDAR_TODO_DAY_COLOR: Color = Color::Magenta;
 const TODO_HEADER_COLOR: Color = Color::Yellow;
 const TODO_TEXT_COLOR: Color = Color::White;
 const TODO_DONE_COLOR: Color = Color::DarkGrey;
@@ -52,6 +56,8 @@ const PANEL_GAP: u16 = 4;
 const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
 const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
+const QUIT_PROMPT_COLOR: Color = Color::Yellow;
+const TODO_SAVE_PATH: &str = "todos.json";
 
 struct AppState {
     font: FontSetting,
@@ -63,6 +69,7 @@ struct AppState {
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
     window_fitted: bool,
+    quit_prompt: bool,
 }
 
 #[derive(Clone)]
@@ -115,6 +122,24 @@ struct Cell {
     fg: Option<Color>,
     bg: Option<Color>,
     crossed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTodoItem {
+    text: String,
+    done: bool,
+    is_placeholder: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTodoDay {
+    date: String,
+    items: Vec<StoredTodoItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTodos {
+    days: Vec<StoredTodoDay>,
 }
 
 struct TodoItem {
@@ -182,9 +207,10 @@ fn main() -> io::Result<()> {
         calendar_month: today.month(),
         selected_date: today,
         pomodoro_start: None,
-        todos: HashMap::new(),
+        todos: load_todos().unwrap_or_default(),
         editing_todo: None,
         window_fitted: false,
+        quit_prompt: false,
     };
 
     enable_raw_mode()?;
@@ -210,13 +236,25 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => {
+                    if state.quit_prompt {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                save_editing_todo(state);
+                                save_todos(&state.todos)?;
+                                break;
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => break,
+                            _ => continue,
+                        }
+                    }
                     if handle_editing_key(state, &key.code) {
                         continue;
                     }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             save_editing_todo(state);
-                            break;
+                            state.quit_prompt = true;
+                            render(stdout, state)?;
                         }
                         KeyCode::Char('-') => {
                             save_editing_todo(state);
@@ -232,6 +270,9 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                     }
                 }
                 Event::Mouse(mouse) => {
+                    if state.quit_prompt {
+                        continue;
+                    }
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         let mut keep_editing = false;
                         if mouse.row == controls.font.y {
@@ -369,6 +410,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         state.calendar_year,
         state.calendar_month,
         state.selected_date,
+        &state.todos,
         state.todos.get(&state.selected_date),
         state.editing_todo.as_ref(),
         0,
@@ -423,10 +465,12 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     let quit_hint_x = total_width
         .saturating_sub(quit_hint.len() as u16)
         .min(width.saturating_sub(quit_hint.len() as u16));
+    let quit_prompt = "Save todos before quitting? (y/n)";
     let calendar = build_calendar_panel(
         state.calendar_year,
         state.calendar_month,
         state.selected_date,
+        &state.todos,
         state.todos.get(&state.selected_date),
         state.editing_todo.as_ref(),
         calendar_x,
@@ -462,6 +506,11 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     stdout.queue(MoveTo(quit_hint_x, font_buttons.y))?;
     stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
     stdout.queue(Print(quit_hint))?;
+    if state.quit_prompt {
+        stdout.queue(MoveTo(8, font_buttons.y))?;
+        stdout.queue(SetForegroundColor(QUIT_PROMPT_COLOR))?;
+        stdout.queue(Print(quit_prompt))?;
+    }
     stdout.queue(MoveTo(start_button.x, start_button.y))?;
     stdout.queue(SetForegroundColor(START_BUTTON_COLOR))?;
     stdout.queue(Print(start_label))?;
@@ -523,6 +572,7 @@ fn build_calendar_panel(
     year: i32,
     month: u32,
     selected_date: NaiveDate,
+    all_todos: &HashMap<NaiveDate, Vec<TodoItem>>,
     todos: Option<&Vec<TodoItem>>,
     editing_todo: Option<&EditingTodo>,
     calendar_x: u16,
@@ -593,11 +643,16 @@ fn build_calendar_panel(
         let index = start_col + (day - 1) as usize;
         let row = 4 + index / 7;
         let col = (index % 7) * 4;
+        let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
         let color = if is_weekend_column(index % 7) {
             CALENDAR_WEEKEND_COLOR
         } else {
             CALENDAR_DAY_COLOR
         };
+        let has_todo = all_todos
+            .get(&date)
+            .map(|items| !items.is_empty())
+            .unwrap_or(false);
         let bg = if today.year() == year && today.month() == month && today.day() == day {
             Some(CALENDAR_CURRENT_DAY_BG)
         } else if selected_date.year() == year
@@ -619,11 +674,15 @@ fn build_calendar_panel(
                 CALENDAR_CURRENT_DAY_COLOR
             }
         } else {
-            color
+            if has_todo {
+                CALENDAR_TODO_DAY_COLOR
+            } else {
+                color
+            }
         };
         write_text(&mut grid, col, row, &format!("{day:>2}"), fg, bg, false);
         date_hits.push(DateHitbox {
-            date: NaiveDate::from_ymd_opt(year, month, day).unwrap(),
+            date,
             x: calendar_x + col as u16,
             end_x: calendar_x + col as u16 + 2,
             y: row as u16,
@@ -1320,6 +1379,67 @@ fn save_editing_todo(state: &mut AppState) {
             }
         }
     }
+}
+
+fn load_todos() -> io::Result<HashMap<NaiveDate, Vec<TodoItem>>> {
+    let path = Path::new(TODO_SAVE_PATH);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let raw = fs::read_to_string(path)?;
+    let stored: StoredTodos = serde_json::from_str(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut todos = HashMap::new();
+
+    for day in stored.days {
+        let date = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let items = day
+            .items
+            .into_iter()
+            .map(|item| TodoItem {
+                text: item.text,
+                done: item.done,
+                is_placeholder: item.is_placeholder,
+            })
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            todos.insert(date, items);
+        }
+    }
+
+    Ok(todos)
+}
+
+fn save_todos(todos: &HashMap<NaiveDate, Vec<TodoItem>>) -> io::Result<()> {
+    let mut days = todos
+        .iter()
+        .filter_map(|(date, items)| {
+            if items.is_empty() {
+                None
+            } else {
+                Some(StoredTodoDay {
+                    date: date.format("%Y-%m-%d").to_string(),
+                    items: items
+                        .iter()
+                        .map(|item| StoredTodoItem {
+                            text: item.text.clone(),
+                            done: item.done,
+                            is_placeholder: item.is_placeholder,
+                        })
+                        .collect(),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    days.sort_by(|left, right| left.date.cmp(&right.date));
+
+    let payload = StoredTodos { days };
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(TODO_SAVE_PATH, json)?;
+    Ok(())
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
