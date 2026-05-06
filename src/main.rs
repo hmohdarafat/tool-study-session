@@ -1198,15 +1198,15 @@ fn pomodoro_marker_style(
         return PomodoroMarkerStyle::Normal;
     };
     let now = Local::now();
-    let elapsed = (now.signed_duration_since(start).num_minutes()).max(0) as u32;
-    if elapsed >= 60 {
+    let elapsed_minutes = (now.minute() + 60 - start.minute()) % 60;
+    if elapsed_minutes == 0 && now.signed_duration_since(start).num_minutes() >= 60 {
         return PomodoroMarkerStyle::Hidden;
     }
 
     let start_minute = start.minute();
     let offset = (minute_marker + 60 - start_minute) % 60;
 
-    if offset < elapsed {
+    if offset < elapsed_minutes {
         PomodoroMarkerStyle::Hidden
     } else if offset < 50 {
         PomodoroMarkerStyle::Work
