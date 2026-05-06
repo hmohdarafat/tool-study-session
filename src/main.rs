@@ -46,6 +46,8 @@ const TODO_TEXT_COLOR: Color = Color::White;
 const TODO_DONE_COLOR: Color = Color::DarkGrey;
 const TODO_BOX_COLOR: Color = Color::Green;
 const TODO_ADD_BUTTON_COLOR: Color = Color::Blue;
+const TODO_DELETE_COLOR: Color = Color::Red;
+const TODO_EDIT_BG: Color = Color::DarkGrey;
 const PANEL_GAP: u16 = 4;
 const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
 const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
@@ -59,6 +61,7 @@ struct AppState {
     selected_date: NaiveDate,
     pomodoro_start: Option<DateTime<Local>>,
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
+    editing_todo: Option<EditingTodo>,
 }
 
 #[derive(Clone)]
@@ -118,11 +121,19 @@ struct TodoItem {
     done: bool,
 }
 
+struct EditingTodo {
+    date: NaiveDate,
+    index: usize,
+    buffer: String,
+}
+
 struct CalendarUiControls {
     buttons: CalendarButtons,
     dates: Vec<DateHitbox>,
     add_button: ActionButton,
-    todos: Vec<TodoHitbox>,
+    todo_checks: Vec<TodoHitbox>,
+    todo_deletes: Vec<TodoHitbox>,
+    todo_texts: Vec<TodoTextHitbox>,
 }
 
 struct DateHitbox {
@@ -137,6 +148,14 @@ struct TodoHitbox {
     x: u16,
     end_x: u16,
     y: u16,
+}
+
+struct TodoTextHitbox {
+    index: usize,
+    x: u16,
+    end_x: u16,
+    y: u16,
+    end_y: u16,
 }
 
 struct CalendarPanel {
@@ -160,6 +179,7 @@ fn main() -> io::Result<()> {
         selected_date: today,
         pomodoro_start: None,
         todos: HashMap::new(),
+        editing_todo: None,
     };
 
     enable_raw_mode()?;
@@ -184,21 +204,33 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('-') => {
-                        adjust_font_size(state, -1)?;
-                        render(stdout, state)?;
+                Event::Key(key) => {
+                    if handle_editing_key(state, &key.code) {
+                        continue;
                     }
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        adjust_font_size(state, 1)?;
-                        render(stdout, state)?;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            save_editing_todo(state);
+                            break;
+                        }
+                        KeyCode::Char('-') => {
+                            save_editing_todo(state);
+                            adjust_font_size(state, -1)?;
+                            render(stdout, state)?;
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            save_editing_todo(state);
+                            adjust_font_size(state, 1)?;
+                            render(stdout, state)?;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Event::Mouse(mouse) => {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let mut keep_editing = false;
                         if mouse.row == controls.font.y {
+                            save_editing_todo(state);
                             if (controls.font.minus_x..controls.font.minus_x + 3)
                                 .contains(&mouse.column)
                             {
@@ -212,6 +244,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             }
                         }
                         if mouse.row == controls.calendar.buttons.y {
+                            save_editing_todo(state);
                             if (controls.calendar.buttons.month_prev_x
                                 ..controls.calendar.buttons.month_prev_end)
                                 .contains(&mouse.column)
@@ -237,12 +270,14 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         if let Some(hit) = controls.calendar.dates.iter().find(|hit| {
                             mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
                         }) {
+                            save_editing_todo(state);
                             state.selected_date = hit.date;
                         }
                         if mouse.row == controls.calendar.add_button.y
                             && (controls.calendar.add_button.x..controls.calendar.add_button.end_x)
                                 .contains(&mouse.column)
                         {
+                            save_editing_todo(state);
                             let next_number = state
                                 .todos
                                 .get(&state.selected_date)
@@ -257,23 +292,54 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                     done: false,
                                 });
                         }
-                        if let Some(hit) = controls.calendar.todos.iter().find(|hit| {
+                        if let Some(hit) = controls.calendar.todo_deletes.iter().find(|hit| {
                             mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
                         }) {
+                            save_editing_todo(state);
+                            if let Some(items) = state.todos.get_mut(&state.selected_date) {
+                                if hit.index < items.len() {
+                                    items.remove(hit.index);
+                                }
+                            }
+                        }
+                        if let Some(hit) = controls.calendar.todo_checks.iter().find(|hit| {
+                            mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
+                        }) {
+                            save_editing_todo(state);
                             if let Some(items) = state.todos.get_mut(&state.selected_date) {
                                 if let Some(item) = items.get_mut(hit.index) {
                                     item.done = !item.done;
                                 }
                             }
                         }
+                        if let Some(hit) = controls.calendar.todo_texts.iter().find(|hit| {
+                            (hit.y..hit.end_y).contains(&mouse.row)
+                                && (hit.x..hit.end_x).contains(&mouse.column)
+                        }) {
+                            save_editing_todo(state);
+                            if let Some(items) = state.todos.get(&state.selected_date) {
+                                if let Some(item) = items.get(hit.index) {
+                                    state.editing_todo = Some(EditingTodo {
+                                        date: state.selected_date,
+                                        index: hit.index,
+                                        buffer: item.text.clone(),
+                                    });
+                                    keep_editing = true;
+                                }
+                            }
+                        }
                         if mouse.row == controls.start.y
                             && (controls.start.x..controls.start.end_x).contains(&mouse.column)
                         {
+                            save_editing_todo(state);
                             state.pomodoro_start = if state.pomodoro_start.is_some() {
                                 None
                             } else {
                                 Some(Local::now())
                             };
+                        }
+                        if !keep_editing {
+                            save_editing_todo(state);
                         }
                     }
                 }
@@ -293,6 +359,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         state.calendar_month,
         state.selected_date,
         state.todos.get(&state.selected_date),
+        state.editing_todo.as_ref(),
         0,
     );
     let calendar_width = calendar
@@ -330,6 +397,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         state.calendar_month,
         state.selected_date,
         state.todos.get(&state.selected_date),
+        state.editing_todo.as_ref(),
         calendar_x,
     );
 
@@ -418,15 +486,40 @@ fn build_calendar_panel(
     month: u32,
     selected_date: NaiveDate,
     todos: Option<&Vec<TodoItem>>,
+    editing_todo: Option<&EditingTodo>,
     calendar_x: u16,
 ) -> CalendarPanel {
     let width = 28usize;
-    let todo_count = todos.map(|items| items.len()).unwrap_or(0);
-    let height = (13 + todo_count.min(6)) as usize;
+    let text_x = 6usize;
+    let text_width = width.saturating_sub(text_x + 1);
+    let todo_rows = todos
+        .map(|items| {
+            items
+                .iter()
+                .take(6)
+                .enumerate()
+                .map(|(index, item)| {
+                    let display_text = if let Some(editing) = editing_todo {
+                        if editing.date == selected_date && editing.index == index {
+                            editing.buffer.as_str()
+                        } else {
+                            item.text.as_str()
+                        }
+                    } else {
+                        item.text.as_str()
+                    };
+                    wrap_text(display_text, text_width).len().max(1)
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let height = 13 + todo_rows;
     let mut grid = vec![vec![blank_cell(); width]; height];
     let buttons = build_calendar_buttons(year, month, calendar_x);
     let mut date_hits = Vec::new();
-    let mut todo_hits = Vec::new();
+    let mut todo_check_hits = Vec::new();
+    let mut todo_delete_hits = Vec::new();
+    let mut todo_text_hits = Vec::new();
     let month_name = month_name(month);
     let title = format!("< {} >", month_name);
     let year_text = format!("< {} >", year);
@@ -524,30 +617,78 @@ fn build_calendar_panel(
         y: todo_header_y as u16,
     };
 
+    let mut current_row = todo_header_y + 2;
     if let Some(items) = todos {
         for (index, item) in items.iter().take(6).enumerate() {
-            let row = todo_header_y + 2 + index;
-            let checkbox = if item.done { "[x]" } else { "[ ]" };
-            write_text(&mut grid, 0, row, checkbox, TODO_BOX_COLOR, None, false);
+            let delete_x = 0;
+            let check_x = 2;
+            let display_text = if let Some(editing) = editing_todo {
+                if editing.date == selected_date && editing.index == index {
+                    editing.buffer.as_str()
+                } else {
+                    item.text.as_str()
+                }
+            } else {
+                item.text.as_str()
+            };
+            let is_editing = editing_todo
+                .map(|editing| editing.date == selected_date && editing.index == index)
+                .unwrap_or(false);
+            let wrapped = wrap_text(display_text, text_width);
             write_text(
                 &mut grid,
-                4,
-                row,
-                &item.text,
-                if item.done {
-                    TODO_DONE_COLOR
-                } else {
-                    TODO_TEXT_COLOR
-                },
+                delete_x,
+                current_row,
+                "x",
+                TODO_DELETE_COLOR,
                 None,
-                item.done,
+                false,
             );
-            todo_hits.push(TodoHitbox {
+            let checkbox = if item.done { "[x]" } else { "[ ]" };
+            write_text(
+                &mut grid,
+                check_x,
+                current_row,
+                checkbox,
+                TODO_BOX_COLOR,
+                None,
+                false,
+            );
+            for (line_offset, line) in wrapped.iter().enumerate() {
+                write_text(
+                    &mut grid,
+                    text_x,
+                    current_row + line_offset,
+                    line,
+                    if item.done {
+                        TODO_DONE_COLOR
+                    } else {
+                        TODO_TEXT_COLOR
+                    },
+                    if is_editing { Some(TODO_EDIT_BG) } else { None },
+                    item.done,
+                );
+            }
+            todo_delete_hits.push(TodoHitbox {
                 index,
                 x: calendar_x,
-                end_x: calendar_x + checkbox.len() as u16,
-                y: row as u16,
+                end_x: calendar_x + 1,
+                y: current_row as u16,
             });
+            todo_check_hits.push(TodoHitbox {
+                index,
+                x: calendar_x + check_x as u16,
+                end_x: calendar_x + check_x as u16 + checkbox.len() as u16,
+                y: current_row as u16,
+            });
+            todo_text_hits.push(TodoTextHitbox {
+                index,
+                x: calendar_x + text_x as u16,
+                end_x: calendar_x + width as u16,
+                y: current_row as u16,
+                end_y: (current_row + wrapped.len()) as u16,
+            });
+            current_row += wrapped.len();
         }
     }
 
@@ -557,7 +698,9 @@ fn build_calendar_panel(
             buttons,
             dates: date_hits,
             add_button,
-            todos: todo_hits,
+            todo_checks: todo_check_hits,
+            todo_deletes: todo_delete_hits,
+            todo_texts: todo_text_hits,
         },
     }
 }
@@ -1048,6 +1191,90 @@ fn shift_month(state: &mut AppState, delta: i32) {
 
 fn is_weekend_column(column: usize) -> bool {
     matches!(column, 5 | 6)
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                for chunk in word.chars().collect::<Vec<_>>().chunks(width) {
+                    lines.push(chunk.iter().collect());
+                }
+            }
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = String::new();
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                for chunk in word.chars().collect::<Vec<_>>().chunks(width) {
+                    lines.push(chunk.iter().collect());
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn handle_editing_key(state: &mut AppState, code: &KeyCode) -> bool {
+    let Some(editing) = state.editing_todo.as_mut() else {
+        return false;
+    };
+
+    match code {
+        KeyCode::Char(c) => {
+            editing.buffer.push(*c);
+            true
+        }
+        KeyCode::Backspace => {
+            editing.buffer.pop();
+            true
+        }
+        KeyCode::Enter | KeyCode::Esc => {
+            save_editing_todo(state);
+            true
+        }
+        _ => true,
+    }
+}
+
+fn save_editing_todo(state: &mut AppState) {
+    let Some(editing) = state.editing_todo.take() else {
+        return;
+    };
+
+    if let Some(items) = state.todos.get_mut(&editing.date) {
+        if let Some(item) = items.get_mut(editing.index) {
+            item.text = editing.buffer;
+        }
+    }
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
