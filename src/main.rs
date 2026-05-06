@@ -56,6 +56,7 @@ const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
 const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
+const POMODORO_STATUS_COLOR: Color = Color::White;
 const TODO_SAVE_PATH: &str = "todos.json";
 const GRADIENT_SPEED: f64 = 24.0;
 const GRADIENT_X_SCALE: f64 = 1.8;
@@ -397,6 +398,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             } else {
                                 Some(Local::now())
                             };
+                            state.pending_height_fit = true;
                         }
                         if !keep_editing {
                             save_editing_todo(state);
@@ -485,17 +487,16 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     } else {
         "[Start]"
     };
-    let start_button = ActionButton {
-        x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
-        end_x: clock_x
-            + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
-            + start_label.len() as u16,
-        y: clock_height.min(content_height),
+    let pomodoro_status = pomodoro_status(state.pomodoro_start);
+    let initial_start_button_y = if pomodoro_status.is_some() {
+        clock_height.saturating_add(4)
+    } else {
+        clock_height.saturating_add(1)
     };
     let desired_height = preview_calendar
         .grid
         .len()
-        .max((start_button.y as usize).saturating_add(1))
+        .max((initial_start_button_y as usize).saturating_add(1))
         .saturating_add(1) as u16;
     if state.pending_height_fit && height != desired_height {
         request_terminal_size(stdout, width, desired_height)?;
@@ -510,12 +511,19 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         clock_height = clock.len() as u16;
     }
     state.pending_height_fit = false;
+    let status_phase_y = clock_height.saturating_add(1);
+    let status_countdown_y = clock_height.saturating_add(2);
+    let start_button_y = if pomodoro_status.is_some() {
+        clock_height.saturating_add(4)
+    } else {
+        clock_height.saturating_add(1)
+    };
     let start_button = ActionButton {
         x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
         end_x: clock_x
             + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
             + start_label.len() as u16,
-        y: clock_height.min(height.saturating_sub(2)),
+        y: start_button_y.min(height.saturating_sub(2)),
     };
     let font_buttons = FontButtons {
         minus_x: 0,
@@ -571,6 +579,30 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
             font_buttons.y as usize,
             quit_prompt,
             QUIT_PROMPT_COLOR,
+            None,
+            false,
+        );
+    }
+    if let Some((phase_label, countdown, phase_color)) = pomodoro_status {
+        let phase_x = clock_x
+            + visible_clock_width.saturating_sub(phase_label.len() as u16) / 2;
+        let countdown_x = clock_x
+            + visible_clock_width.saturating_sub(countdown.len() as u16) / 2;
+        write_text(
+            &mut frame,
+            phase_x as usize,
+            status_phase_y as usize,
+            &phase_label,
+            phase_color,
+            None,
+            false,
+        );
+        write_text(
+            &mut frame,
+            countdown_x as usize,
+            status_countdown_y as usize,
+            &countdown,
+            POMODORO_STATUS_COLOR,
             None,
             false,
         );
@@ -1433,6 +1465,28 @@ fn marker_style_color(style: PomodoroMarkerStyle, normal: Color) -> Color {
         PomodoroMarkerStyle::Break => POMODORO_BREAK_COLOR,
         PomodoroMarkerStyle::Hidden => normal,
     }
+}
+
+fn pomodoro_status(pomodoro_start: Option<DateTime<Local>>) -> Option<(String, String, Color)> {
+    let start = pomodoro_start?;
+    let now = Local::now();
+    let elapsed_seconds = now.signed_duration_since(start).num_seconds().max(0);
+
+    let (phase_label, phase_color, remaining_seconds) = if elapsed_seconds < 50 * 60 {
+        ("Work / Study", POMODORO_WORK_COLOR, 50 * 60 - elapsed_seconds)
+    } else if elapsed_seconds < 60 * 60 {
+        ("Break", POMODORO_BREAK_COLOR, 60 * 60 - elapsed_seconds)
+    } else {
+        ("Break", POMODORO_BREAK_COLOR, 0)
+    };
+
+    let minutes = remaining_seconds / 60;
+    let seconds = remaining_seconds % 60;
+    Some((
+        phase_label.to_string(),
+        format!("{minutes:02}:{seconds:02}"),
+        phase_color,
+    ))
 }
 
 fn write_text(
