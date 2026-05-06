@@ -32,7 +32,6 @@ const HOUR_HAND_COLOR: Color = Color::Magenta;
 const MINUTE_HAND_COLOR: Color = Color::Green;
 const CENTER_COLOR: Color = Color::White;
 const CONTROL_COLOR: Color = Color::Blue;
-const FONT_INFO_COLOR: Color = Color::DarkCyan;
 const CALENDAR_HEADER_COLOR: Color = Color::Magenta;
 const CALENDAR_YEAR_COLOR: Color = Color::Cyan;
 const CALENDAR_WEEKDAY_COLOR: Color = Color::Blue;
@@ -63,6 +62,7 @@ struct AppState {
     pomodoro_start: Option<DateTime<Local>>,
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
+    window_fitted: bool,
 }
 
 #[derive(Clone)]
@@ -184,6 +184,7 @@ fn main() -> io::Result<()> {
         pomodoro_start: None,
         todos: HashMap::new(),
         editing_todo: None,
+        window_fitted: false,
     };
 
     enable_raw_mode()?;
@@ -362,7 +363,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     Ok(())
 }
 
-fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
+fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     let (mut width, mut height) = terminal::size()?;
     let preview_calendar = build_calendar_panel(
         state.calendar_year,
@@ -374,7 +375,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     );
     let required_height = (preview_calendar.grid.len() as u16).saturating_add(2);
     if height < required_height {
-        request_terminal_height(stdout, width, required_height)?;
+        request_terminal_size(stdout, width, required_height)?;
         let (new_width, new_height) = terminal::size()?;
         width = new_width;
         height = new_height;
@@ -391,7 +392,14 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     let clock_width = clock.first().map(|line| line.len() as u16).unwrap_or(0);
     let clock_height = clock.len() as u16;
     let total_width = calendar_width + PANEL_GAP + clock_width;
-    let calendar_x = width.saturating_sub(total_width);
+    if !state.window_fitted {
+        request_terminal_size(stdout, total_width, height)?;
+        let (new_width, new_height) = terminal::size()?;
+        width = new_width;
+        height = new_height;
+        state.window_fitted = true;
+    }
+    let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
     let start_label = if state.pomodoro_start.is_some() {
@@ -412,7 +420,9 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
     };
     let quit_hint = "q = quit";
-    let quit_hint_x = width.saturating_sub(quit_hint.len() as u16);
+    let quit_hint_x = total_width
+        .saturating_sub(quit_hint.len() as u16)
+        .min(width.saturating_sub(quit_hint.len() as u16));
     let calendar = build_calendar_panel(
         state.calendar_year,
         state.calendar_month,
@@ -449,11 +459,8 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     stdout.queue(Print("[-]"))?;
     stdout.queue(MoveTo(font_buttons.plus_x, font_buttons.y))?;
     stdout.queue(Print("[+]"))?;
-    stdout.queue(MoveTo(8, font_buttons.y))?;
-    stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
-    stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
     stdout.queue(MoveTo(quit_hint_x, font_buttons.y))?;
-    stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
+    stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
     stdout.queue(Print(quit_hint))?;
     stdout.queue(MoveTo(start_button.x, start_button.y))?;
     stdout.queue(SetForegroundColor(START_BUTTON_COLOR))?;
@@ -468,7 +475,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     })
 }
 
-fn request_terminal_height(stdout: &mut Stdout, width: u16, height: u16) -> io::Result<()> {
+fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Result<()> {
     write!(stdout, "\x1b[8;{};{}t", height.max(1), width.max(1))?;
     stdout.flush()?;
     thread::sleep(Duration::from_millis(120));
