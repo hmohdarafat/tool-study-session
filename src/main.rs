@@ -120,12 +120,15 @@ struct Cell {
 struct TodoItem {
     text: String,
     done: bool,
+    is_placeholder: bool,
 }
 
 struct EditingTodo {
     date: NaiveDate,
     index: usize,
     buffer: String,
+    original_text: String,
+    was_placeholder: bool,
 }
 
 struct CalendarUiControls {
@@ -291,6 +294,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 .push(TodoItem {
                                     text: format!("Todo {next_number}"),
                                     done: false,
+                                    is_placeholder: true,
                                 });
                         }
                         if let Some(hit) = controls.calendar.todo_deletes.iter().find(|hit| {
@@ -323,7 +327,13 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                     state.editing_todo = Some(EditingTodo {
                                         date: state.selected_date,
                                         index: hit.index,
-                                        buffer: item.text.clone(),
+                                        buffer: if item.is_placeholder {
+                                            String::new()
+                                        } else {
+                                            item.text.clone()
+                                        },
+                                        original_text: item.text.clone(),
+                                        was_placeholder: item.is_placeholder,
                                     });
                                     keep_editing = true;
                                 }
@@ -401,6 +411,8 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         plus_x: 4,
         y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
     };
+    let quit_hint = "q = quit";
+    let quit_hint_x = width.saturating_sub(quit_hint.len() as u16);
     let calendar = build_calendar_panel(
         state.calendar_year,
         state.calendar_month,
@@ -440,6 +452,9 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     stdout.queue(MoveTo(8, font_buttons.y))?;
     stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
     stdout.queue(Print(format!("{} {}", state.font.family, state.font.size)))?;
+    stdout.queue(MoveTo(quit_hint_x, font_buttons.y))?;
+    stdout.queue(SetForegroundColor(FONT_INFO_COLOR))?;
+    stdout.queue(Print(quit_hint))?;
     stdout.queue(MoveTo(start_button.x, start_button.y))?;
     stdout.queue(SetForegroundColor(START_BUTTON_COLOR))?;
     stdout.queue(Print(start_label))?;
@@ -508,6 +523,7 @@ fn build_calendar_panel(
     let width = 28usize;
     let text_x = 6usize;
     let text_width = width.saturating_sub(text_x + 1);
+    let year_x = 14usize;
     let todo_rows = todos
         .map(|items| {
             items
@@ -543,7 +559,7 @@ fn build_calendar_panel(
     write_text(&mut grid, 0, 0, &title, CALENDAR_HEADER_COLOR, None, false);
     write_text(
         &mut grid,
-        buttons.year_prev_x as usize,
+        year_x,
         0,
         &year_text,
         CALENDAR_YEAR_COLOR,
@@ -1288,7 +1304,13 @@ fn save_editing_todo(state: &mut AppState) {
 
     if let Some(items) = state.todos.get_mut(&editing.date) {
         if let Some(item) = items.get_mut(editing.index) {
-            item.text = editing.buffer;
+            if editing.buffer.trim().is_empty() && editing.was_placeholder {
+                item.text = editing.original_text;
+                item.is_placeholder = true;
+            } else {
+                item.text = editing.buffer;
+                item.is_placeholder = false;
+            }
         }
     }
 }
