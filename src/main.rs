@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::io::{self, Stdout, Write, stdout};
 use std::process::Command;
+use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
@@ -352,9 +353,8 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 }
 
 fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
-    let (width, height) = terminal::size()?;
-    let content_height = height.saturating_sub(2);
-    let calendar = build_calendar_panel(
+    let (mut width, mut height) = terminal::size()?;
+    let preview_calendar = build_calendar_panel(
         state.calendar_year,
         state.calendar_month,
         state.selected_date,
@@ -362,7 +362,16 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         state.editing_todo.as_ref(),
         0,
     );
-    let calendar_width = calendar
+    let required_height = (preview_calendar.grid.len() as u16).saturating_add(2);
+    if height < required_height {
+        request_terminal_height(stdout, width, required_height)?;
+        let (new_width, new_height) = terminal::size()?;
+        width = new_width;
+        height = new_height;
+    }
+
+    let content_height = height.saturating_sub(2);
+    let calendar_width = preview_calendar
         .grid
         .first()
         .map(|line| line.len() as u16)
@@ -442,6 +451,13 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         calendar: calendar.controls,
         start: start_button,
     })
+}
+
+fn request_terminal_height(stdout: &mut Stdout, width: u16, height: u16) -> io::Result<()> {
+    write!(stdout, "\x1b[8;{};{}t", height.max(1), width.max(1))?;
+    stdout.flush()?;
+    thread::sleep(Duration::from_millis(120));
+    Ok(())
 }
 
 fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
