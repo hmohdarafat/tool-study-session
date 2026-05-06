@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::env;
 use std::f64::consts::PI;
 use std::fs;
 use std::io::{self, Stdout, Write, stdout};
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,7 +59,7 @@ const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const POMODORO_STATUS_COLOR: Color = Color::White;
 const POMODORO_INACTIVE_COLOR: Color = Color::Grey;
-const TODO_SAVE_PATH: &str = "todos.json";
+const TODO_FILE_NAME: &str = "todos.json";
 const GRADIENT_SPEED: f64 = 24.0;
 const GRADIENT_X_SCALE: f64 = 1.8;
 const GRADIENT_Y_SCALE: f64 = 1.4;
@@ -551,7 +552,12 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     );
 
     let mut frame = build_gradient_frame(width as usize, height as usize);
-    overlay_grid(&mut frame, &calendar.grid, calendar_x as usize, origin_y as usize);
+    overlay_grid(
+        &mut frame,
+        &calendar.grid,
+        calendar_x as usize,
+        origin_y as usize,
+    );
     overlay_grid(&mut frame, &clock, clock_x as usize, origin_y as usize);
     write_text(
         &mut frame,
@@ -825,14 +831,17 @@ fn gradient_color(x: usize, y: usize, width: usize, height: usize) -> Color {
     let green = channel(drift, glow, tide, shimmer, 8.0, 30.0, 0.37);
     let blue = channel(shimmer, tide, field, glow, 14.0, 44.0, 0.63);
 
-    Color::Rgb { r: red, g: green, b: blue }
+    Color::Rgb {
+        r: red,
+        g: green,
+        b: blue,
+    }
 }
 
 fn soft_field(phase: f64, x_ratio: f64, y_ratio: f64) -> f64 {
     let broad = ((x_ratio * GRADIENT_X_SCALE + phase) * 2.0 * PI).sin();
     let tall = ((y_ratio * GRADIENT_Y_SCALE - phase * 0.7 + 0.23) * 2.0 * PI).sin();
-    let diagonal = (((x_ratio * 0.9 + y_ratio * 0.7) * 1.3 + phase * 0.5 + 0.41) * 2.0 * PI)
-        .sin();
+    let diagonal = (((x_ratio * 0.9 + y_ratio * 0.7) * 1.3 + phase * 0.5 + 0.41) * 2.0 * PI).sin();
     0.45 * broad + 0.35 * tall + 0.20 * diagonal
 }
 
@@ -1736,7 +1745,14 @@ fn save_editing_todo(state: &mut AppState) {
 }
 
 fn load_todos() -> io::Result<HashMap<NaiveDate, Vec<TodoItem>>> {
-    let path = Path::new(TODO_SAVE_PATH);
+    let data_path = todo_file_path();
+    let legacy_path = PathBuf::from(TODO_FILE_NAME);
+    let path = if data_path.exists() || !legacy_path.exists() {
+        data_path
+    } else {
+        legacy_path
+    };
+
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -1792,8 +1808,28 @@ fn save_todos(todos: &HashMap<NaiveDate, Vec<TodoItem>>) -> io::Result<()> {
     let payload = StoredTodos { days };
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(TODO_SAVE_PATH, json)?;
+    let path = todo_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)?;
     Ok(())
+}
+
+fn todo_file_path() -> PathBuf {
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        });
+
+    data_home
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tool-study-session")
+        .join(TODO_FILE_NAME)
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
