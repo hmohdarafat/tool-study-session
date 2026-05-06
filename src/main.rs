@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::io::{self, Stdout, Write, stdout};
 use std::process::Command;
@@ -8,7 +9,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode,
@@ -38,6 +39,13 @@ const CALENDAR_DAY_COLOR: Color = Color::Green;
 const CALENDAR_WEEKEND_COLOR: Color = Color::Red;
 const CALENDAR_CURRENT_DAY_COLOR: Color = Color::White;
 const CALENDAR_CURRENT_DAY_BG: Color = Color::DarkBlue;
+const CALENDAR_SELECTED_DAY_COLOR: Color = Color::Black;
+const CALENDAR_SELECTED_DAY_BG: Color = Color::Cyan;
+const TODO_HEADER_COLOR: Color = Color::Yellow;
+const TODO_TEXT_COLOR: Color = Color::White;
+const TODO_DONE_COLOR: Color = Color::DarkGrey;
+const TODO_BOX_COLOR: Color = Color::Green;
+const TODO_ADD_BUTTON_COLOR: Color = Color::Blue;
 const PANEL_GAP: u16 = 4;
 const POMODORO_WORK_COLOR: Color = Color::DarkGreen;
 const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
@@ -48,7 +56,9 @@ struct AppState {
     original_font: FontSetting,
     calendar_year: i32,
     calendar_month: u32,
+    selected_date: NaiveDate,
     pomodoro_start: Option<DateTime<Local>>,
+    todos: HashMap<NaiveDate, Vec<TodoItem>>,
 }
 
 #[derive(Clone)]
@@ -78,7 +88,7 @@ struct CalendarButtons {
 
 struct UiControls {
     font: FontButtons,
-    calendar: CalendarButtons,
+    calendar: CalendarUiControls,
     start: ActionButton,
 }
 
@@ -100,6 +110,38 @@ struct Cell {
     ch: char,
     fg: Option<Color>,
     bg: Option<Color>,
+    crossed: bool,
+}
+
+struct TodoItem {
+    text: String,
+    done: bool,
+}
+
+struct CalendarUiControls {
+    buttons: CalendarButtons,
+    dates: Vec<DateHitbox>,
+    add_button: ActionButton,
+    todos: Vec<TodoHitbox>,
+}
+
+struct DateHitbox {
+    date: NaiveDate,
+    x: u16,
+    end_x: u16,
+    y: u16,
+}
+
+struct TodoHitbox {
+    index: usize,
+    x: u16,
+    end_x: u16,
+    y: u16,
+}
+
+struct CalendarPanel {
+    grid: Vec<Vec<Cell>>,
+    controls: CalendarUiControls,
 }
 
 fn main() -> io::Result<()> {
@@ -115,7 +157,9 @@ fn main() -> io::Result<()> {
         original_font: initial_font,
         calendar_year: today.year(),
         calendar_month: today.month(),
+        selected_date: today,
         pomodoro_start: None,
+        todos: HashMap::new(),
     };
 
     enable_raw_mode()?;
@@ -167,26 +211,59 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 render(stdout, state)?;
                             }
                         }
-                        if mouse.row == controls.calendar.y {
-                            if (controls.calendar.month_prev_x..controls.calendar.month_prev_end)
+                        if mouse.row == controls.calendar.buttons.y {
+                            if (controls.calendar.buttons.month_prev_x
+                                ..controls.calendar.buttons.month_prev_end)
                                 .contains(&mouse.column)
                             {
                                 shift_month(state, -1);
-                            } else if (controls.calendar.month_next_x
-                                ..controls.calendar.month_next_end)
+                            } else if (controls.calendar.buttons.month_next_x
+                                ..controls.calendar.buttons.month_next_end)
                                 .contains(&mouse.column)
                             {
                                 shift_month(state, 1);
-                            } else if (controls.calendar.year_prev_x
-                                ..controls.calendar.year_prev_end)
+                            } else if (controls.calendar.buttons.year_prev_x
+                                ..controls.calendar.buttons.year_prev_end)
                                 .contains(&mouse.column)
                             {
                                 state.calendar_year -= 1;
-                            } else if (controls.calendar.year_next_x
-                                ..controls.calendar.year_next_end)
+                            } else if (controls.calendar.buttons.year_next_x
+                                ..controls.calendar.buttons.year_next_end)
                                 .contains(&mouse.column)
                             {
                                 state.calendar_year += 1;
+                            }
+                        }
+                        if let Some(hit) = controls.calendar.dates.iter().find(|hit| {
+                            mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
+                        }) {
+                            state.selected_date = hit.date;
+                        }
+                        if mouse.row == controls.calendar.add_button.y
+                            && (controls.calendar.add_button.x..controls.calendar.add_button.end_x)
+                                .contains(&mouse.column)
+                        {
+                            let next_number = state
+                                .todos
+                                .get(&state.selected_date)
+                                .map(|items| items.len() + 1)
+                                .unwrap_or(1);
+                            state
+                                .todos
+                                .entry(state.selected_date)
+                                .or_default()
+                                .push(TodoItem {
+                                    text: format!("Todo {next_number}"),
+                                    done: false,
+                                });
+                        }
+                        if let Some(hit) = controls.calendar.todos.iter().find(|hit| {
+                            mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
+                        }) {
+                            if let Some(items) = state.todos.get_mut(&state.selected_date) {
+                                if let Some(item) = items.get_mut(hit.index) {
+                                    item.done = !item.done;
+                                }
                             }
                         }
                         if mouse.row == controls.start.y
@@ -211,8 +288,18 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     let (width, height) = terminal::size()?;
     let content_height = height.saturating_sub(2);
-    let calendar = build_calendar(state.calendar_year, state.calendar_month);
-    let calendar_width = calendar.first().map(|line| line.len() as u16).unwrap_or(0);
+    let calendar = build_calendar_panel(
+        state.calendar_year,
+        state.calendar_month,
+        state.selected_date,
+        state.todos.get(&state.selected_date),
+        0,
+    );
+    let calendar_width = calendar
+        .grid
+        .first()
+        .map(|line| line.len() as u16)
+        .unwrap_or(0);
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
     let clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
     let clock_width = clock.first().map(|line| line.len() as u16).unwrap_or(0);
@@ -238,12 +325,17 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
         plus_x: 4,
         y: height.saturating_sub(FONT_BUTTON_Y_PADDING),
     };
-    let calendar_buttons =
-        build_calendar_buttons(state.calendar_year, state.calendar_month, calendar_x);
+    let calendar = build_calendar_panel(
+        state.calendar_year,
+        state.calendar_month,
+        state.selected_date,
+        state.todos.get(&state.selected_date),
+        calendar_x,
+    );
 
     stdout.queue(Clear(ClearType::All))?;
 
-    for (row, line) in calendar.iter().enumerate() {
+    for (row, line) in calendar.grid.iter().enumerate() {
         let y = origin_y.saturating_add(row as u16);
         if y >= height {
             break;
@@ -279,7 +371,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
     stdout.flush()?;
     Ok(UiControls {
         font: font_buttons,
-        calendar: calendar_buttons,
+        calendar: calendar.controls,
         start: start_button,
     })
 }
@@ -287,6 +379,7 @@ fn render(stdout: &mut Stdout, state: &AppState) -> io::Result<UiControls> {
 fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
     let mut active_fg = None;
     let mut active_bg = None;
+    let mut active_crossed = false;
     for cell in line {
         if cell.fg != active_fg {
             match cell.fg {
@@ -304,23 +397,41 @@ fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
             }
             active_bg = cell.bg;
         }
+        if cell.crossed != active_crossed {
+            stdout.queue(SetAttribute(if cell.crossed {
+                Attribute::CrossedOut
+            } else {
+                Attribute::NotCrossedOut
+            }))?;
+            active_crossed = cell.crossed;
+        }
         stdout.queue(Print(cell.ch))?;
     }
     stdout.queue(ResetColor)?;
     stdout.queue(crossterm::style::SetBackgroundColor(Color::Reset))?;
+    stdout.queue(SetAttribute(Attribute::NotCrossedOut))?;
     Ok(())
 }
 
-fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
+fn build_calendar_panel(
+    year: i32,
+    month: u32,
+    selected_date: NaiveDate,
+    todos: Option<&Vec<TodoItem>>,
+    calendar_x: u16,
+) -> CalendarPanel {
     let width = 28usize;
-    let height = 10usize;
+    let todo_count = todos.map(|items| items.len()).unwrap_or(0);
+    let height = (13 + todo_count.min(6)) as usize;
     let mut grid = vec![vec![blank_cell(); width]; height];
-    let buttons = build_calendar_buttons(year, month, 0);
+    let buttons = build_calendar_buttons(year, month, calendar_x);
+    let mut date_hits = Vec::new();
+    let mut todo_hits = Vec::new();
     let month_name = month_name(month);
     let title = format!("< {} >", month_name);
     let year_text = format!("< {} >", year);
 
-    write_text(&mut grid, 0, 0, &title, CALENDAR_HEADER_COLOR, None);
+    write_text(&mut grid, 0, 0, &title, CALENDAR_HEADER_COLOR, None, false);
     write_text(
         &mut grid,
         buttons.year_prev_x as usize,
@@ -328,6 +439,7 @@ fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
         &year_text,
         CALENDAR_YEAR_COLOR,
         None,
+        false,
     );
 
     let weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
@@ -337,7 +449,7 @@ fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
         } else {
             CALENDAR_WEEKDAY_COLOR
         };
-        write_text(&mut grid, idx * 4, 2, day, color, None);
+        write_text(&mut grid, idx * 4, 2, day, color, None, false);
     }
 
     let first_day = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
@@ -356,18 +468,98 @@ fn build_calendar(year: i32, month: u32) -> Vec<Vec<Cell>> {
         };
         let bg = if today.year() == year && today.month() == month && today.day() == day {
             Some(CALENDAR_CURRENT_DAY_BG)
+        } else if selected_date.year() == year
+            && selected_date.month() == month
+            && selected_date.day() == day
+        {
+            Some(CALENDAR_SELECTED_DAY_BG)
         } else {
             None
         };
         let fg = if bg.is_some() {
-            CALENDAR_CURRENT_DAY_COLOR
+            if selected_date.year() == year
+                && selected_date.month() == month
+                && selected_date.day() == day
+                && !(today.year() == year && today.month() == month && today.day() == day)
+            {
+                CALENDAR_SELECTED_DAY_COLOR
+            } else {
+                CALENDAR_CURRENT_DAY_COLOR
+            }
         } else {
             color
         };
-        write_text(&mut grid, col, row, &format!("{day:>2}"), fg, bg);
+        write_text(&mut grid, col, row, &format!("{day:>2}"), fg, bg, false);
+        date_hits.push(DateHitbox {
+            date: NaiveDate::from_ymd_opt(year, month, day).unwrap(),
+            x: calendar_x + col as u16,
+            end_x: calendar_x + col as u16 + 2,
+            y: row as u16,
+        });
     }
 
-    grid
+    let todo_header_y = 10usize;
+    let add_label = "[+]";
+    write_text(
+        &mut grid,
+        0,
+        todo_header_y,
+        add_label,
+        TODO_ADD_BUTTON_COLOR,
+        None,
+        false,
+    );
+    write_text(
+        &mut grid,
+        4,
+        todo_header_y,
+        &format!("Todos {}", selected_date.format("%Y-%m-%d")),
+        TODO_HEADER_COLOR,
+        None,
+        false,
+    );
+    let add_button = ActionButton {
+        x: calendar_x,
+        end_x: calendar_x + add_label.len() as u16,
+        y: todo_header_y as u16,
+    };
+
+    if let Some(items) = todos {
+        for (index, item) in items.iter().take(6).enumerate() {
+            let row = todo_header_y + 2 + index;
+            let checkbox = if item.done { "[x]" } else { "[ ]" };
+            write_text(&mut grid, 0, row, checkbox, TODO_BOX_COLOR, None, false);
+            write_text(
+                &mut grid,
+                4,
+                row,
+                &item.text,
+                if item.done {
+                    TODO_DONE_COLOR
+                } else {
+                    TODO_TEXT_COLOR
+                },
+                None,
+                item.done,
+            );
+            todo_hits.push(TodoHitbox {
+                index,
+                x: calendar_x,
+                end_x: calendar_x + checkbox.len() as u16,
+                y: row as u16,
+            });
+        }
+    }
+
+    CalendarPanel {
+        grid,
+        controls: CalendarUiControls {
+            buttons,
+            dates: date_hits,
+            add_button,
+            todos: todo_hits,
+        },
+    }
 }
 
 fn build_clock(
@@ -570,6 +762,7 @@ fn place_text(
                 ch,
                 fg: Some(color),
                 bg: None,
+                crossed: false,
             };
         }
     }
@@ -649,6 +842,7 @@ fn plot_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char, colo
             ch: glyph,
             fg: Some(color),
             bg: None,
+            crossed: false,
         };
     }
 }
@@ -695,6 +889,7 @@ fn overwrite_hand_point(grid: &mut [Vec<Cell>], x: usize, y: usize, glyph: char,
             ch: glyph,
             fg: Some(color),
             bg: None,
+            crossed: false,
         };
     }
 }
@@ -707,6 +902,7 @@ fn draw_center(grid: &mut [Vec<Cell>], center_x: f64, center_y: f64) {
             ch: '+',
             fg: Some(CENTER_COLOR),
             bg: None,
+            crossed: false,
         };
     }
 }
@@ -730,6 +926,7 @@ fn blank_cell() -> Cell {
         ch: ' ',
         fg: None,
         bg: None,
+        crossed: false,
     }
 }
 
@@ -774,6 +971,7 @@ fn write_text(
     text: &str,
     fg: Color,
     bg: Option<Color>,
+    crossed: bool,
 ) {
     if y >= grid.len() {
         return;
@@ -785,6 +983,7 @@ fn write_text(
                 ch,
                 fg: Some(fg),
                 bg,
+                crossed,
             };
         }
     }
