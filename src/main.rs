@@ -60,6 +60,16 @@ const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const POMODORO_STATUS_COLOR: Color = Color::White;
 const POMODORO_INACTIVE_COLOR: Color = Color::Grey;
 const TODO_FILE_NAME: &str = "todos.json";
+const FOCUS_TRACKER_SECONDS: usize = 50 * 60;
+const FOCUS_GRAPH_WIDTH: usize = 50;
+const FOCUS_LIVE_SECONDS: usize = FOCUS_GRAPH_WIDTH;
+const FOCUS_SUMMARY_ROWS: usize = 6;
+const FOCUS_HEADER_COLOR: Color = Color::Yellow;
+const FOCUS_FOCUSED_COLOR: Color = Color::Green;
+const FOCUS_BREAKING_COLOR: Color = Color::Yellow;
+const FOCUS_BROKEN_COLOR: Color = Color::Red;
+const FOCUS_AXIS_COLOR: Color = Color::DarkGrey;
+const FOCUS_ACTIVE_BG: Color = Color::DarkBlue;
 const GRADIENT_SPEED: f64 = 24.0;
 const GRADIENT_X_SCALE: f64 = 1.8;
 const GRADIENT_Y_SCALE: f64 = 1.4;
@@ -72,6 +82,9 @@ struct AppState {
     calendar_month: u32,
     selected_date: NaiveDate,
     pomodoro_start: Option<DateTime<Local>>,
+    focus_level: FocusLevel,
+    focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+    last_focus_sample_second: Option<usize>,
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
     window_fitted: bool,
@@ -174,9 +187,24 @@ struct CalendarUiControls {
     buttons: CalendarButtons,
     dates: Vec<DateHitbox>,
     add_button: ActionButton,
+    focus_buttons: Vec<FocusButtonHitbox>,
     todo_checks: Vec<TodoHitbox>,
     todo_deletes: Vec<TodoHitbox>,
     todo_texts: Vec<TodoTextHitbox>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusLevel {
+    Focused,
+    Breaking,
+    Broken,
+}
+
+struct FocusButtonHitbox {
+    level: FocusLevel,
+    x: u16,
+    end_x: u16,
+    y: u16,
 }
 
 struct DateHitbox {
@@ -221,6 +249,9 @@ fn main() -> io::Result<()> {
         calendar_month: today.month(),
         selected_date: today,
         pomodoro_start: None,
+        focus_level: FocusLevel::Focused,
+        focus_samples: [None; FOCUS_TRACKER_SECONDS],
+        last_focus_sample_second: None,
         todos: load_todos().unwrap_or_default(),
         editing_todo: None,
         window_fitted: false,
@@ -267,9 +298,24 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
+                        KeyCode::Esc => {
                             save_editing_todo(state);
                             state.quit_prompt = true;
+                            controls = render(stdout, state)?;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            save_editing_todo(state);
+                            set_focus_level(state, FocusLevel::Focused);
+                            controls = render(stdout, state)?;
+                        }
+                        KeyCode::Char('w') | KeyCode::Char('W') => {
+                            save_editing_todo(state);
+                            set_focus_level(state, FocusLevel::Breaking);
+                            controls = render(stdout, state)?;
+                        }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            save_editing_todo(state);
+                            set_focus_level(state, FocusLevel::Broken);
                             controls = render(stdout, state)?;
                         }
                         KeyCode::Char('-') => {
@@ -398,13 +444,22 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 }
                             }
                         }
+                        if let Some(hit) = controls.calendar.focus_buttons.iter().find(|hit| {
+                            mouse.row == hit.y && (hit.x..hit.end_x).contains(&mouse.column)
+                        }) {
+                            save_editing_todo(state);
+                            set_focus_level(state, hit.level);
+                        }
                         if mouse.row == controls.start.y
                             && (controls.start.x..controls.start.end_x).contains(&mouse.column)
                         {
                             save_editing_todo(state);
                             state.pomodoro_start = if state.pomodoro_start.is_some() {
+                                state.last_focus_sample_second = None;
                                 None
                             } else {
+                                state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
+                                state.last_focus_sample_second = None;
                                 Some(Local::now())
                             };
                             state.pending_height_fit = true;
@@ -442,6 +497,8 @@ fn gradient_poll_interval() -> Duration {
 }
 
 fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
+    record_focus_sample(state);
+
     let (mut width, mut height) = terminal::size()?;
     let preview_calendar = build_calendar_panel(
         state.calendar_year,
@@ -450,6 +507,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         &state.todos,
         state.todos.get(&state.selected_date),
         state.editing_todo.as_ref(),
+        state.pomodoro_start,
+        state.focus_level,
+        &state.focus_samples,
         0,
     );
     let minimum_height = (preview_calendar.grid.len() as u16).saturating_add(2);
@@ -466,7 +526,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         .first()
         .map(|line| line.len() as u16)
         .unwrap_or(0);
-    let quit_hint = "q = quit";
+    let quit_hint = "Esc = quit  q/w/e = focus";
     let footer_width = quit_hint.len() as u16;
     if !state.window_fitted {
         let preferred_clock = build_clock(
@@ -485,9 +545,6 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     }
     let content_height = height.saturating_sub(2);
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-    let mut clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
-    let mut visible_clock_width = visible_grid_width(&clock);
-    let mut clock_height = clock.len() as u16;
     let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
     let origin_y: u16 = 0;
@@ -497,6 +554,15 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         "[Start]"
     };
     let pomodoro_status = pomodoro_status(state.pomodoro_start);
+    let clock_footer_rows = if pomodoro_status.is_some() { 4 } else { 1 };
+    let available_clock_height = content_height.saturating_sub(clock_footer_rows);
+    let mut clock = build_clock(
+        available_clock_width,
+        available_clock_height,
+        state.pomodoro_start,
+    );
+    let mut visible_clock_width = visible_grid_width(&clock);
+    let mut clock_height = clock.len() as u16;
     let initial_start_button_y = if pomodoro_status.is_some() {
         clock_height.saturating_add(4)
     } else {
@@ -515,7 +581,12 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
 
         let content_height = height.saturating_sub(2);
         let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-        clock = build_clock(available_clock_width, content_height, state.pomodoro_start);
+        let available_clock_height = content_height.saturating_sub(clock_footer_rows);
+        clock = build_clock(
+            available_clock_width,
+            available_clock_height,
+            state.pomodoro_start,
+        );
         visible_clock_width = visible_grid_width(&clock);
         clock_height = clock.len() as u16;
     }
@@ -532,7 +603,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         end_x: clock_x
             + visible_clock_width.saturating_sub(start_label.len() as u16) / 2
             + start_label.len() as u16,
-        y: start_button_y.min(height.saturating_sub(2)),
+        y: start_button_y,
     };
     let font_buttons = FontButtons {
         minus_x: 0,
@@ -548,6 +619,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         &state.todos,
         state.todos.get(&state.selected_date),
         state.editing_todo.as_ref(),
+        state.pomodoro_start,
+        state.focus_level,
+        &state.focus_samples,
         calendar_x,
     );
 
@@ -899,12 +973,16 @@ fn build_calendar_panel(
     all_todos: &HashMap<NaiveDate, Vec<TodoItem>>,
     todos: Option<&Vec<TodoItem>>,
     editing_todo: Option<&EditingTodo>,
+    pomodoro_start: Option<DateTime<Local>>,
+    focus_level: FocusLevel,
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     calendar_x: u16,
 ) -> CalendarPanel {
-    let width = 28usize;
+    let width = 58usize;
     let text_x = 6usize;
     let text_width = width.saturating_sub(text_x + 1);
     let year_x = 14usize;
+    let focus_rows = 23usize;
     let todo_rows = todos
         .map(|items| {
             items
@@ -925,13 +1003,14 @@ fn build_calendar_panel(
                 .sum::<usize>()
         })
         .unwrap_or(0);
-    let height = 13 + todo_rows;
+    let height = 13 + todo_rows + focus_rows;
     let mut grid = vec![vec![blank_cell(); width]; height];
     let buttons = build_calendar_buttons(year, month, calendar_x);
     let mut date_hits = Vec::new();
     let mut todo_check_hits = Vec::new();
     let mut todo_delete_hits = Vec::new();
     let mut todo_text_hits = Vec::new();
+    let mut focus_button_hits = Vec::new();
     let month_name = month_name(month);
     let title = format!("< {} >", month_name);
     let year_text = format!("< {} >", year);
@@ -1112,6 +1191,16 @@ fn build_calendar_panel(
             current_row += wrapped.len();
         }
     }
+    current_row += 2;
+    draw_focus_tracker(
+        &mut grid,
+        calendar_x,
+        current_row,
+        pomodoro_start,
+        focus_level,
+        focus_samples,
+        &mut focus_button_hits,
+    );
 
     CalendarPanel {
         grid,
@@ -1119,10 +1208,230 @@ fn build_calendar_panel(
             buttons,
             dates: date_hits,
             add_button,
+            focus_buttons: focus_button_hits,
             todo_checks: todo_check_hits,
             todo_deletes: todo_delete_hits,
             todo_texts: todo_text_hits,
         },
+    }
+}
+
+fn draw_focus_tracker(
+    grid: &mut [Vec<Cell>],
+    calendar_x: u16,
+    start_y: usize,
+    pomodoro_start: Option<DateTime<Local>>,
+    focus_level: FocusLevel,
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+    focus_button_hits: &mut Vec<FocusButtonHitbox>,
+) {
+    let buttons_y = start_y + 2;
+    let live_label_y = start_y + 4;
+    let live_graph_y = start_y + 5;
+    let summary_label_y = start_y + 11;
+    let summary_graph_y = start_y + 12;
+    let stats_y = start_y + 21;
+    let graph_x = 6usize;
+    let current_second = focus_elapsed_second(pomodoro_start);
+
+    write_text(
+        grid,
+        0,
+        start_y,
+        "Focus tracker",
+        FOCUS_HEADER_COLOR,
+        None,
+        false,
+    );
+
+    let mut button_x = 0usize;
+    for (label, level) in [
+        ("[Focused]", FocusLevel::Focused),
+        ("[Focus breaking]", FocusLevel::Breaking),
+        ("[Focus broken]", FocusLevel::Broken),
+    ] {
+        let color = focus_level_color(level);
+        let bg = if level == focus_level {
+            Some(FOCUS_ACTIVE_BG)
+        } else {
+            None
+        };
+        write_text(grid, button_x, buttons_y, label, color, bg, false);
+        focus_button_hits.push(FocusButtonHitbox {
+            level,
+            x: calendar_x + button_x as u16,
+            end_x: calendar_x + button_x as u16 + label.len() as u16,
+            y: buttons_y as u16,
+        });
+        button_x += label.len() + 1;
+    }
+
+    write_text(
+        grid,
+        0,
+        live_label_y,
+        "Live 50s",
+        FOCUS_HEADER_COLOR,
+        None,
+        false,
+    );
+    draw_focus_axis(grid, live_graph_y);
+    draw_live_focus_graph(grid, graph_x, live_graph_y, current_second, focus_samples);
+    write_text(
+        grid,
+        graph_x,
+        live_graph_y + 4,
+        "-49s      -40s      -30s      -20s      -10s   now",
+        FOCUS_AXIS_COLOR,
+        None,
+        false,
+    );
+
+    write_text(
+        grid,
+        0,
+        summary_label_y,
+        "Full 50m average",
+        FOCUS_HEADER_COLOR,
+        None,
+        false,
+    );
+    draw_summary_focus_axis(grid, summary_graph_y);
+    draw_summary_focus_graph(grid, graph_x, summary_graph_y, focus_samples);
+    write_text(
+        grid,
+        graph_x,
+        summary_graph_y + FOCUS_SUMMARY_ROWS + 1,
+        "0         10        20        30        40       50m",
+        FOCUS_AXIS_COLOR,
+        None,
+        false,
+    );
+
+    let (focused, breaking, broken) = focus_percentages(focus_samples);
+    write_text(
+        grid,
+        0,
+        stats_y,
+        &format!("Focused {focused:>3}%  Breaking {breaking:>3}%  Broken {broken:>3}%"),
+        FOCUS_AXIS_COLOR,
+        None,
+        false,
+    );
+}
+
+fn draw_focus_axis(grid: &mut [Vec<Cell>], graph_y: usize) {
+    for (row_offset, label) in [(0usize, "1.0 |"), (1, "0.5 |"), (2, "0.0 |")] {
+        write_text(
+            grid,
+            0,
+            graph_y + row_offset,
+            label,
+            FOCUS_AXIS_COLOR,
+            None,
+            false,
+        );
+    }
+}
+
+fn draw_summary_focus_axis(grid: &mut [Vec<Cell>], graph_y: usize) {
+    for (row_offset, label) in [
+        (0usize, "1.0 |"),
+        (1, "0.8 |"),
+        (2, "0.6 |"),
+        (3, "0.4 |"),
+        (4, "0.2 |"),
+        (5, "0.0 |"),
+    ] {
+        write_text(
+            grid,
+            0,
+            graph_y + row_offset,
+            label,
+            FOCUS_AXIS_COLOR,
+            None,
+            false,
+        );
+    }
+}
+
+fn draw_live_focus_graph(
+    grid: &mut [Vec<Cell>],
+    graph_x: usize,
+    graph_y: usize,
+    current_second: Option<usize>,
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+) {
+    let live_start = current_second
+        .map(|second| second.saturating_sub(FOCUS_LIVE_SECONDS.saturating_sub(1)))
+        .unwrap_or(0);
+
+    for column in 0..FOCUS_GRAPH_WIDTH {
+        let x = graph_x + column;
+        for row_offset in 0..3 {
+            write_text(
+                grid,
+                x,
+                graph_y + row_offset,
+                ".",
+                FOCUS_AXIS_COLOR,
+                None,
+                false,
+            );
+        }
+
+        let sample_second = live_start + column;
+        if sample_second >= FOCUS_TRACKER_SECONDS {
+            continue;
+        }
+        if current_second
+            .map(|second| sample_second > second)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(level) = focus_samples[sample_second] {
+            let y = graph_y + focus_level_row(level);
+            write_text(grid, x, y, "*", focus_level_color(level), None, false);
+        }
+    }
+
+    if let Some(current_second) = current_second {
+        if current_second < FOCUS_TRACKER_SECONDS {
+            let x =
+                graph_x + (current_second.saturating_sub(live_start)).min(FOCUS_GRAPH_WIDTH - 1);
+            if let Some(level) = focus_samples[current_second] {
+                let y = graph_y + focus_level_row(level);
+                write_text(grid, x, y, "o", focus_level_color(level), None, false);
+            }
+        }
+    }
+}
+
+fn draw_summary_focus_graph(
+    grid: &mut [Vec<Cell>],
+    graph_x: usize,
+    graph_y: usize,
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+) {
+    for column in 0..FOCUS_GRAPH_WIDTH {
+        let x = graph_x + column;
+        for row_offset in 0..FOCUS_SUMMARY_ROWS {
+            write_text(
+                grid,
+                x,
+                graph_y + row_offset,
+                ".",
+                FOCUS_AXIS_COLOR,
+                None,
+                false,
+            );
+        }
+
+        if let Some(average) = average_focus_score_for_summary_column(focus_samples, column) {
+            let y = graph_y + focus_average_row(average);
+            write_text(grid, x, y, "*", focus_average_color(average), None, false);
+        }
     }
 }
 
@@ -1525,6 +1834,131 @@ fn marker_style_color(style: PomodoroMarkerStyle, normal: Color) -> Color {
         PomodoroMarkerStyle::Work => POMODORO_WORK_COLOR,
         PomodoroMarkerStyle::Break => POMODORO_BREAK_COLOR,
         PomodoroMarkerStyle::Hidden => normal,
+    }
+}
+
+fn record_focus_sample(state: &mut AppState) {
+    let Some(current_second) = focus_elapsed_second(state.pomodoro_start) else {
+        return;
+    };
+    if current_second >= FOCUS_TRACKER_SECONDS {
+        return;
+    }
+
+    let start_second = state
+        .last_focus_sample_second
+        .map(|second| second.saturating_add(1))
+        .unwrap_or(0)
+        .min(current_second);
+
+    for second in start_second..=current_second {
+        state.focus_samples[second] = Some(state.focus_level);
+    }
+    state.last_focus_sample_second = Some(current_second);
+}
+
+fn set_focus_level(state: &mut AppState, level: FocusLevel) {
+    record_focus_sample(state);
+    state.focus_level = level;
+    record_focus_sample(state);
+}
+
+fn focus_elapsed_second(pomodoro_start: Option<DateTime<Local>>) -> Option<usize> {
+    let start = pomodoro_start?;
+    let elapsed_seconds = Local::now().signed_duration_since(start).num_seconds();
+    if elapsed_seconds < 0 {
+        return None;
+    }
+    Some(elapsed_seconds as usize)
+}
+
+fn average_focus_score_for_summary_column(
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+    column: usize,
+) -> Option<f64> {
+    let start = column * FOCUS_TRACKER_SECONDS / FOCUS_GRAPH_WIDTH;
+    let end = ((column + 1) * FOCUS_TRACKER_SECONDS / FOCUS_GRAPH_WIDTH).min(FOCUS_TRACKER_SECONDS);
+
+    let mut total_score = 0.0;
+    let mut sample_count = 0usize;
+
+    for level in focus_samples[start..end].iter().flatten() {
+        total_score += focus_level_score(*level);
+        sample_count += 1;
+    }
+
+    if sample_count == 0 {
+        return None;
+    }
+
+    Some(total_score / sample_count as f64)
+}
+
+fn focus_level_score(level: FocusLevel) -> f64 {
+    match level {
+        FocusLevel::Focused => 1.0,
+        FocusLevel::Breaking => 0.5,
+        FocusLevel::Broken => 0.0,
+    }
+}
+
+fn focus_average_row(average: f64) -> usize {
+    let scaled = (average.clamp(0.0, 1.0) * (FOCUS_SUMMARY_ROWS - 1) as f64).round() as usize;
+    (FOCUS_SUMMARY_ROWS - 1).saturating_sub(scaled)
+}
+
+fn focus_average_color(average: f64) -> Color {
+    if average >= 2.0 / 3.0 {
+        FOCUS_FOCUSED_COLOR
+    } else if average >= 1.0 / 3.0 {
+        FOCUS_BREAKING_COLOR
+    } else {
+        FOCUS_BROKEN_COLOR
+    }
+}
+
+fn focus_percentages(focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS]) -> (u8, u8, u8) {
+    let mut focused = 0usize;
+    let mut breaking = 0usize;
+    let mut broken = 0usize;
+
+    for level in focus_samples.iter().flatten() {
+        match level {
+            FocusLevel::Focused => focused += 1,
+            FocusLevel::Breaking => breaking += 1,
+            FocusLevel::Broken => broken += 1,
+        }
+    }
+
+    let total = focused + breaking + broken;
+    if total == 0 {
+        return (0, 0, 0);
+    }
+
+    (
+        focus_percentage(focused, total),
+        focus_percentage(breaking, total),
+        focus_percentage(broken, total),
+    )
+}
+
+fn focus_percentage(count: usize, total: usize) -> u8 {
+    ((count * 100 + total / 2) / total) as u8
+}
+
+fn focus_level_row(level: FocusLevel) -> usize {
+    match level {
+        FocusLevel::Focused => 0,
+        FocusLevel::Breaking => 1,
+        FocusLevel::Broken => 2,
+    }
+}
+
+fn focus_level_color(level: FocusLevel) -> Color {
+    match level {
+        FocusLevel::Focused => FOCUS_FOCUSED_COLOR,
+        FocusLevel::Breaking => FOCUS_BREAKING_COLOR,
+        FocusLevel::Broken => FOCUS_BROKEN_COLOR,
     }
 }
 
