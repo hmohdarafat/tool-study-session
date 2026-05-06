@@ -58,6 +58,9 @@ const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const TODO_SAVE_PATH: &str = "todos.json";
+const GRADIENT_SPEED: f64 = 45.0;
+const GRADIENT_X_SCALE: f64 = 0.18;
+const GRADIENT_Y_SCALE: f64 = 0.32;
 
 struct AppState {
     font: FontSetting,
@@ -495,45 +498,62 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         calendar_x,
     );
 
-    stdout.queue(Clear(ClearType::All))?;
-
-    for (row, line) in calendar.grid.iter().enumerate() {
-        let y = origin_y.saturating_add(row as u16);
-        if y >= height {
-            break;
-        }
-
-        stdout.queue(MoveTo(calendar_x, y))?;
-        write_colored_line(stdout, line)?;
-    }
-
-    for (row, line) in clock.iter().enumerate() {
-        let y = origin_y.saturating_add(row as u16);
-        if y >= height {
-            break;
-        }
-
-        stdout.queue(MoveTo(clock_x, y))?;
-        write_colored_line(stdout, line)?;
-    }
-
-    stdout.queue(MoveTo(font_buttons.minus_x, font_buttons.y))?;
-    stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
-    stdout.queue(Print("[-]"))?;
-    stdout.queue(MoveTo(font_buttons.plus_x, font_buttons.y))?;
-    stdout.queue(Print("[+]"))?;
-    stdout.queue(MoveTo(quit_hint_x, font_buttons.y))?;
-    stdout.queue(SetForegroundColor(CONTROL_COLOR))?;
-    stdout.queue(Print(quit_hint))?;
+    let mut frame = build_gradient_frame(width as usize, height as usize);
+    overlay_grid(&mut frame, &calendar.grid, calendar_x as usize, origin_y as usize);
+    overlay_grid(&mut frame, &clock, clock_x as usize, origin_y as usize);
+    write_text(
+        &mut frame,
+        font_buttons.minus_x as usize,
+        font_buttons.y as usize,
+        "[-]",
+        CONTROL_COLOR,
+        None,
+        false,
+    );
+    write_text(
+        &mut frame,
+        font_buttons.plus_x as usize,
+        font_buttons.y as usize,
+        "[+]",
+        CONTROL_COLOR,
+        None,
+        false,
+    );
+    write_text(
+        &mut frame,
+        quit_hint_x as usize,
+        font_buttons.y as usize,
+        quit_hint,
+        CONTROL_COLOR,
+        None,
+        false,
+    );
     if state.quit_prompt {
-        stdout.queue(MoveTo(8, font_buttons.y))?;
-        stdout.queue(SetForegroundColor(QUIT_PROMPT_COLOR))?;
-        stdout.queue(Print(quit_prompt))?;
+        write_text(
+            &mut frame,
+            8,
+            font_buttons.y as usize,
+            quit_prompt,
+            QUIT_PROMPT_COLOR,
+            None,
+            false,
+        );
     }
-    stdout.queue(MoveTo(start_button.x, start_button.y))?;
-    stdout.queue(SetForegroundColor(START_BUTTON_COLOR))?;
-    stdout.queue(Print(start_label))?;
-    stdout.queue(ResetColor)?;
+    write_text(
+        &mut frame,
+        start_button.x as usize,
+        start_button.y as usize,
+        start_label,
+        START_BUTTON_COLOR,
+        None,
+        false,
+    );
+
+    stdout.queue(Clear(ClearType::All))?;
+    for (row, line) in frame.iter().enumerate() {
+        stdout.queue(MoveTo(0, row as u16))?;
+        write_colored_line(stdout, line)?;
+    }
 
     stdout.flush()?;
     Ok(UiControls {
@@ -548,6 +568,72 @@ fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Re
     stdout.flush()?;
     thread::sleep(Duration::from_millis(120));
     Ok(())
+}
+
+fn build_gradient_frame(width: usize, height: usize) -> Vec<Vec<Cell>> {
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| Cell {
+                    ch: ' ',
+                    fg: None,
+                    bg: Some(gradient_color(x, y, width, height)),
+                    crossed: false,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn overlay_grid(frame: &mut [Vec<Cell>], overlay: &[Vec<Cell>], offset_x: usize, offset_y: usize) {
+    for (row_idx, row) in overlay.iter().enumerate() {
+        let target_y = offset_y + row_idx;
+        if target_y >= frame.len() {
+            break;
+        }
+
+        for (col_idx, cell) in row.iter().enumerate() {
+            let target_x = offset_x + col_idx;
+            if target_x >= frame[target_y].len() {
+                break;
+            }
+
+            if cell.ch != ' ' || cell.fg.is_some() || cell.bg.is_some() || cell.crossed {
+                let target = &mut frame[target_y][target_x];
+                target.ch = cell.ch;
+                target.fg = cell.fg;
+                target.crossed = cell.crossed;
+                if cell.bg.is_some() {
+                    target.bg = cell.bg;
+                }
+            }
+        }
+    }
+}
+
+fn gradient_color(x: usize, y: usize, width: usize, height: usize) -> Color {
+    let now = Local::now();
+    let phase = now.timestamp_millis() as f64 / 1_000.0 / GRADIENT_SPEED;
+    let x_ratio = if width > 1 {
+        x as f64 / (width - 1) as f64
+    } else {
+        0.0
+    };
+    let y_ratio = if height > 1 {
+        y as f64 / (height - 1) as f64
+    } else {
+        0.0
+    };
+
+    let red = wave(phase + x_ratio * GRADIENT_X_SCALE + y_ratio * 0.08, 10.0, 42.0);
+    let green = wave(phase + y_ratio * GRADIENT_Y_SCALE + 0.33, 12.0, 36.0);
+    let blue = wave(phase + (x_ratio + y_ratio) * 0.22 + 0.66, 22.0, 64.0);
+
+    Color::Rgb { r: red, g: green, b: blue }
+}
+
+fn wave(position: f64, min: f64, amplitude: f64) -> u8 {
+    (min + amplitude * (0.5 + 0.5 * (position * 2.0 * PI).sin())).round() as u8
 }
 
 fn write_colored_line(stdout: &mut Stdout, line: &[Cell]) -> io::Result<()> {
@@ -1239,10 +1325,11 @@ fn write_text(
     for (idx, ch) in text.chars().enumerate() {
         let px = x + idx;
         if px < grid[y].len() {
+            let existing_bg = grid[y][px].bg;
             grid[y][px] = Cell {
                 ch,
                 fg: Some(fg),
-                bg,
+                bg: bg.or(existing_bg),
                 crossed,
             };
         }
