@@ -5,7 +5,7 @@ use std::io::{self, Stdout, Write, stdout};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -601,9 +601,22 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
 }
 
 fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Result<()> {
-    write!(stdout, "\x1b[8;{};{}t", height.max(1), width.max(1))?;
+    let target_width = width.max(1);
+    let target_height = height.max(1);
+    let current_size = terminal::size()?;
+    if current_size == (target_width, target_height) {
+        return Ok(());
+    }
+
+    write!(stdout, "\x1b[8;{};{}t", target_height, target_width)?;
     stdout.flush()?;
-    thread::sleep(Duration::from_millis(120));
+    let deadline = Instant::now() + Duration::from_millis(40);
+    while Instant::now() < deadline {
+        if terminal::size()? == (target_width, target_height) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
     Ok(())
 }
 
