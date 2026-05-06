@@ -57,6 +57,7 @@ const POMODORO_BREAK_COLOR: Color = Color::DarkRed;
 const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const POMODORO_STATUS_COLOR: Color = Color::White;
+const POMODORO_INACTIVE_COLOR: Color = Color::Grey;
 const TODO_SAVE_PATH: &str = "todos.json";
 const GRADIENT_SPEED: f64 = 24.0;
 const GRADIENT_X_SCALE: f64 = 1.8;
@@ -119,6 +120,13 @@ enum PomodoroMarkerStyle {
     Normal,
     Work,
     Break,
+}
+
+struct PomodoroStatus {
+    work_countdown: String,
+    break_countdown: String,
+    work_color: Color,
+    break_color: Color,
 }
 
 #[derive(Clone, Copy)]
@@ -583,26 +591,70 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
             false,
         );
     }
-    if let Some((phase_label, countdown, phase_color)) = pomodoro_status {
-        let phase_x = clock_x
-            + visible_clock_width.saturating_sub(phase_label.len() as u16) / 2;
-        let countdown_x = clock_x
-            + visible_clock_width.saturating_sub(countdown.len() as u16) / 2;
+    if let Some(status) = pomodoro_status {
+        let work_label = "Work / Study";
+        let break_label = "Break";
+        let left_width = work_label.len().max(status.work_countdown.len()) as u16;
+        let right_width = break_label.len().max(status.break_countdown.len()) as u16;
+        let block_width = left_width + 3 + right_width;
+        let block_x = clock_x + visible_clock_width.saturating_sub(block_width) / 2;
+        let right_x = block_x + left_width + 3;
+        let work_countdown_x =
+            block_x + left_width.saturating_sub(status.work_countdown.len() as u16) / 2;
+        let break_countdown_x =
+            right_x + right_width.saturating_sub(status.break_countdown.len() as u16) / 2;
+
         write_text(
             &mut frame,
-            phase_x as usize,
+            block_x as usize,
             status_phase_y as usize,
-            &phase_label,
-            phase_color,
+            work_label,
+            status.work_color,
             None,
             false,
         );
         write_text(
             &mut frame,
-            countdown_x as usize,
-            status_countdown_y as usize,
-            &countdown,
+            (block_x + left_width) as usize,
+            status_phase_y as usize,
+            " | ",
             POMODORO_STATUS_COLOR,
+            None,
+            false,
+        );
+        write_text(
+            &mut frame,
+            right_x as usize,
+            status_phase_y as usize,
+            break_label,
+            status.break_color,
+            None,
+            false,
+        );
+        write_text(
+            &mut frame,
+            work_countdown_x as usize,
+            status_countdown_y as usize,
+            &status.work_countdown,
+            status.work_color,
+            None,
+            false,
+        );
+        write_text(
+            &mut frame,
+            (block_x + left_width) as usize,
+            status_countdown_y as usize,
+            " | ",
+            POMODORO_STATUS_COLOR,
+            None,
+            false,
+        );
+        write_text(
+            &mut frame,
+            break_countdown_x as usize,
+            status_countdown_y as usize,
+            &status.break_countdown,
+            status.break_color,
             None,
             false,
         );
@@ -1467,26 +1519,42 @@ fn marker_style_color(style: PomodoroMarkerStyle, normal: Color) -> Color {
     }
 }
 
-fn pomodoro_status(pomodoro_start: Option<DateTime<Local>>) -> Option<(String, String, Color)> {
+fn pomodoro_status(pomodoro_start: Option<DateTime<Local>>) -> Option<PomodoroStatus> {
     let start = pomodoro_start?;
     let now = Local::now();
     let elapsed_seconds = now.signed_duration_since(start).num_seconds().max(0);
 
-    let (phase_label, phase_color, remaining_seconds) = if elapsed_seconds < 50 * 60 {
-        ("Work / Study", POMODORO_WORK_COLOR, 50 * 60 - elapsed_seconds)
+    let (work_remaining, break_remaining, work_color, break_color) = if elapsed_seconds < 50 * 60 {
+        (
+            50 * 60 - elapsed_seconds,
+            10 * 60,
+            POMODORO_WORK_COLOR,
+            POMODORO_INACTIVE_COLOR,
+        )
     } else if elapsed_seconds < 60 * 60 {
-        ("Break", POMODORO_BREAK_COLOR, 60 * 60 - elapsed_seconds)
+        (
+            0,
+            60 * 60 - elapsed_seconds,
+            POMODORO_INACTIVE_COLOR,
+            POMODORO_BREAK_COLOR,
+        )
     } else {
-        ("Break", POMODORO_BREAK_COLOR, 0)
+        (0, 0, POMODORO_INACTIVE_COLOR, POMODORO_INACTIVE_COLOR)
     };
 
-    let minutes = remaining_seconds / 60;
-    let seconds = remaining_seconds % 60;
-    Some((
-        phase_label.to_string(),
-        format!("{minutes:02}:{seconds:02}"),
-        phase_color,
-    ))
+    Some(PomodoroStatus {
+        work_countdown: format_countdown(work_remaining),
+        break_countdown: format_countdown(break_remaining),
+        work_color,
+        break_color,
+    })
+}
+
+fn format_countdown(remaining_seconds: i64) -> String {
+    let safe_seconds = remaining_seconds.max(0);
+    let minutes = safe_seconds / 60;
+    let seconds = safe_seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
 }
 
 fn write_text(
