@@ -69,6 +69,7 @@ const NOISE_BUTTON_COLOR: Color = Color::Cyan;
 const NOISE_BUTTON_ACTIVE_BG: Color = Color::DarkBlue;
 const NOISE_VOLUME_COLOR: Color = Color::White;
 const TODO_FILE_NAME: &str = "todos.json";
+const FOCUS_MEMORY_FILE_NAME: &str = "focus-memory.json";
 const FOCUS_TRACKER_SECONDS: usize = 50 * 60;
 const FOCUS_GRAPH_WIDTH: usize = 50;
 const FOCUS_LIVE_SECONDS: usize = FOCUS_GRAPH_WIDTH;
@@ -85,6 +86,8 @@ const GRADIENT_Y_SCALE: f64 = 1.4;
 const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const FOCUS_TINT_TRANSITION_MS: u64 = 1_300;
 const POMODORO_TINT_TRANSITION_MS: u64 = 1_000;
+const POMODORO_TINT_MAX_ALPHA: f32 = 0.58;
+const PAST_WINDOW_LOOP_SECONDS: f32 = 3.2;
 
 struct AppState {
     font: FontSetting,
@@ -101,6 +104,7 @@ struct AppState {
     pomodoro_tint_started_at: Option<Instant>,
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
+    saved_focus_pattern: Option<SavedFocusPattern>,
     selected_noise: Option<NoiseKind>,
     noise_volume: u8,
     noise_audio: NoiseAudio,
@@ -217,6 +221,40 @@ struct StoredTodos {
     days: Vec<StoredTodoDay>,
 }
 
+#[derive(Clone, Copy)]
+struct LeastProductiveWindow {
+    start_second: usize,
+    end_second: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SavedFocusPattern {
+    LeastProductiveWindow(LeastProductiveWindow),
+    FullWorkLoop,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredFocusMemory {
+    pattern: Option<StoredSavedFocusPattern>,
+    least_productive_window: Option<StoredLeastProductiveWindow>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredLeastProductiveWindow {
+    start_second: usize,
+    end_second: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum StoredSavedFocusPattern {
+    LeastProductiveWindow {
+        start_second: usize,
+        end_second: usize,
+    },
+    FullWorkLoop,
+}
+
 struct TodoItem {
     text: String,
     done: bool,
@@ -305,6 +343,7 @@ fn main() -> io::Result<()> {
         pomodoro_tint_started_at: None,
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
+        saved_focus_pattern: load_focus_memory().ok().flatten(),
         selected_noise: None,
         noise_volume: 50,
         noise_audio: NoiseAudio::new(),
@@ -336,7 +375,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
     loop {
         if pomodoro_finished(state.pomodoro_start) {
-            toggle_pomodoro(state);
+            complete_pomodoro_session(state)?;
             state.pending_height_fit = true;
             controls = render(stdout, state)?;
             continue;
@@ -393,7 +432,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         }
                         KeyCode::Char(' ') => {
                             save_editing_todo(state);
-                            toggle_pomodoro(state);
+                            toggle_pomodoro_session(state)?;
                             state.pending_height_fit = true;
                             controls = render(stdout, state)?;
                         }
@@ -543,7 +582,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             && (controls.start.x..controls.start.end_x).contains(&mouse.column)
                         {
                             save_editing_todo(state);
-                            toggle_pomodoro(state);
+                            toggle_pomodoro_session(state)?;
                             state.pending_height_fit = true;
                         }
                         if !keep_editing {
@@ -749,9 +788,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     let mut frame = build_gradient_frame(
         width as usize,
         height as usize,
-        state.focus_tint_from,
-        state.focus_level,
-        focus_tint_progress(state),
+        current_background_focus_bias(state),
         pomodoro_tint_alpha(state),
     );
     overlay_grid(
@@ -1078,9 +1115,7 @@ fn trim_grid(grid: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
 fn build_gradient_frame(
     width: usize,
     height: usize,
-    focus_tint_from: FocusLevel,
-    focus_level: FocusLevel,
-    tint_progress: f32,
+    focus_bias: (f32, f32, f32),
     tint_alpha: f32,
 ) -> Vec<Vec<Cell>> {
     (0..height)
@@ -1094,9 +1129,7 @@ fn build_gradient_frame(
                         y,
                         width,
                         height,
-                        focus_tint_from,
-                        focus_level,
-                        tint_progress,
+                        focus_bias,
                         tint_alpha,
                     )),
                     crossed: false,
@@ -1137,9 +1170,7 @@ fn gradient_color(
     y: usize,
     width: usize,
     height: usize,
-    focus_tint_from: FocusLevel,
-    focus_level: FocusLevel,
-    tint_progress: f32,
+    focus_bias: (f32, f32, f32),
     tint_alpha: f32,
 ) -> Color {
     let now = Local::now();
@@ -1170,15 +1201,8 @@ fn gradient_color(
     let red = channel(field, bloom, ember, glow, 6.0, 34.0, 0.11);
     let green = channel(drift, glow, tide, shimmer, 8.0, 30.0, 0.37);
     let blue = channel(shimmer, tide, field, glow, 14.0, 44.0, 0.63);
-    let (red_bias, green_bias, blue_bias) = interpolate_bias(
-        (0.0, 0.0, 0.0),
-        interpolate_bias(
-            focus_background_bias(focus_tint_from),
-            focus_background_bias(focus_level),
-            tint_progress,
-        ),
-        tint_alpha,
-    );
+    let (red_bias, green_bias, blue_bias) =
+        interpolate_bias((0.0, 0.0, 0.0), focus_bias, tint_alpha);
 
     Color::Rgb {
         r: ((red as f32 + red_bias).round().clamp(0.0, 255.0)) as u8,
@@ -2176,22 +2200,73 @@ fn set_focus_level(state: &mut AppState, level: FocusLevel) {
     record_focus_sample(state);
 }
 
-fn toggle_pomodoro(state: &mut AppState) {
-    let current_alpha = pomodoro_tint_alpha(state);
-    let was_active = state.pomodoro_start.is_some();
-    state.pomodoro_tint_from = current_alpha;
-    state.pomodoro_tint_to = if was_active { 0.0 } else { 1.0 };
-    state.pomodoro_tint_started_at = Some(Instant::now());
-
-    if was_active {
-        state.pomodoro_start = None;
-        state.last_focus_sample_second = None;
-    } else {
-        set_focus_level(state, FocusLevel::Focused);
-        state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
-        state.last_focus_sample_second = None;
-        state.pomodoro_start = Some(Local::now());
+fn current_background_focus_bias(state: &mut AppState) -> (f32, f32, f32) {
+    if let Some(loop_mix) = past_window_loop_mix(state) {
+        return interpolate_bias(
+            focus_background_bias(FocusLevel::Focused),
+            focus_background_bias(FocusLevel::Broken),
+            loop_mix,
+        );
     }
+
+    interpolate_bias(
+        focus_background_bias(state.focus_tint_from),
+        focus_background_bias(state.focus_level),
+        focus_tint_progress(state),
+    )
+}
+
+fn toggle_pomodoro_session(state: &mut AppState) -> io::Result<()> {
+    if state.pomodoro_start.is_some() {
+        stop_pomodoro_session_manually(state)
+    } else {
+        start_pomodoro_session(state);
+        Ok(())
+    }
+}
+
+fn start_pomodoro_session(state: &mut AppState) {
+    let current_alpha = pomodoro_tint_alpha(state);
+    state.pomodoro_tint_from = current_alpha;
+    state.pomodoro_tint_to = POMODORO_TINT_MAX_ALPHA;
+    state.pomodoro_tint_started_at = Some(Instant::now());
+    set_focus_level(state, FocusLevel::Focused);
+    state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
+    state.last_focus_sample_second = None;
+    state.pomodoro_start = Some(Local::now());
+}
+
+fn stop_pomodoro_session(state: &mut AppState) -> io::Result<()> {
+    let current_alpha = pomodoro_tint_alpha(state);
+    state.pomodoro_tint_from = current_alpha;
+    state.pomodoro_tint_to = 0.0;
+    state.pomodoro_tint_started_at = Some(Instant::now());
+    state.pomodoro_start = None;
+    state.last_focus_sample_second = None;
+    Ok(())
+}
+
+fn stop_pomodoro_session_manually(state: &mut AppState) -> io::Result<()> {
+    record_focus_sample(state);
+    if focus_elapsed_second(state.pomodoro_start).is_some_and(|second| second < 50 * 60) {
+        state.saved_focus_pattern = Some(SavedFocusPattern::FullWorkLoop);
+        save_focus_memory(state.saved_focus_pattern)?;
+    }
+    stop_pomodoro_session(state)
+}
+
+fn complete_pomodoro_session(state: &mut AppState) -> io::Result<()> {
+    record_focus_sample(state);
+    state.saved_focus_pattern =
+        least_productive_interval(&state.focus_samples).map(|(_, start_second, end_second)| {
+            SavedFocusPattern::LeastProductiveWindow(LeastProductiveWindow {
+                start_second,
+                end_second,
+            })
+        });
+    save_focus_memory(state.saved_focus_pattern)?;
+    stop_pomodoro_session(state)?;
+    Ok(())
 }
 
 fn focus_tint_progress(state: &mut AppState) -> f32 {
@@ -2239,6 +2314,27 @@ fn ease_in_out_sine(progress: f32) -> f32 {
 
 fn interpolate_scalar(from: f32, to: f32, progress: f32) -> f32 {
     from + (to - from) * progress
+}
+
+fn past_window_loop_mix(state: &AppState) -> Option<f32> {
+    let pattern = state.saved_focus_pattern?;
+    let current_second = focus_elapsed_second(state.pomodoro_start)?;
+
+    match pattern {
+        SavedFocusPattern::LeastProductiveWindow(window) => {
+            if current_second < window.start_second || current_second >= window.end_second {
+                return None;
+            }
+        }
+        SavedFocusPattern::FullWorkLoop => {
+            if current_second >= 50 * 60 {
+                return None;
+            }
+        }
+    }
+
+    let phase = Local::now().timestamp_millis() as f32 / 1_000.0 / PAST_WINDOW_LOOP_SECONDS;
+    Some(0.5 - 0.5 * (2.0 * PI as f32 * phase).cos())
 }
 
 fn focus_elapsed_second(pomodoro_start: Option<DateTime<Local>>) -> Option<usize> {
@@ -2747,7 +2843,7 @@ fn save_editing_todo(state: &mut AppState) {
 }
 
 fn load_todos() -> io::Result<HashMap<NaiveDate, Vec<TodoItem>>> {
-    let data_path = todo_file_path();
+    let data_path = app_data_file_path(TODO_FILE_NAME);
     let legacy_path = PathBuf::from(TODO_FILE_NAME);
     let path = if data_path.exists() || !legacy_path.exists() {
         data_path
@@ -2810,7 +2906,7 @@ fn save_todos(todos: &HashMap<NaiveDate, Vec<TodoItem>>) -> io::Result<()> {
     let payload = StoredTodos { days };
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let path = todo_file_path();
+    let path = app_data_file_path(TODO_FILE_NAME);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2818,7 +2914,69 @@ fn save_todos(todos: &HashMap<NaiveDate, Vec<TodoItem>>) -> io::Result<()> {
     Ok(())
 }
 
-fn todo_file_path() -> PathBuf {
+fn load_focus_memory() -> io::Result<Option<SavedFocusPattern>> {
+    let path = app_data_file_path(FOCUS_MEMORY_FILE_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)?;
+    let stored: StoredFocusMemory = serde_json::from_str(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    Ok(match stored.pattern {
+        Some(StoredSavedFocusPattern::LeastProductiveWindow {
+            start_second,
+            end_second,
+        }) if start_second < end_second && end_second <= FOCUS_TRACKER_SECONDS => {
+            Some(SavedFocusPattern::LeastProductiveWindow(
+                LeastProductiveWindow {
+                    start_second,
+                    end_second,
+                },
+            ))
+        }
+        Some(StoredSavedFocusPattern::FullWorkLoop) => Some(SavedFocusPattern::FullWorkLoop),
+        _ => stored.least_productive_window.and_then(|window| {
+            if window.start_second < window.end_second && window.end_second <= FOCUS_TRACKER_SECONDS
+            {
+                Some(SavedFocusPattern::LeastProductiveWindow(
+                    LeastProductiveWindow {
+                        start_second: window.start_second,
+                        end_second: window.end_second,
+                    },
+                ))
+            } else {
+                None
+            }
+        }),
+    })
+}
+
+fn save_focus_memory(pattern: Option<SavedFocusPattern>) -> io::Result<()> {
+    let payload = StoredFocusMemory {
+        pattern: pattern.map(|pattern| match pattern {
+            SavedFocusPattern::LeastProductiveWindow(window) => {
+                StoredSavedFocusPattern::LeastProductiveWindow {
+                    start_second: window.start_second,
+                    end_second: window.end_second,
+                }
+            }
+            SavedFocusPattern::FullWorkLoop => StoredSavedFocusPattern::FullWorkLoop,
+        }),
+        least_productive_window: None,
+    };
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let path = app_data_file_path(FOCUS_MEMORY_FILE_NAME);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn app_data_file_path(file_name: &str) -> PathBuf {
     let data_home = env::var_os("XDG_DATA_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -2831,7 +2989,7 @@ fn todo_file_path() -> PathBuf {
     data_home
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tool-study-session")
-        .join(TODO_FILE_NAME)
+        .join(file_name)
 }
 
 fn current_font_setting() -> io::Result<FontSetting> {
