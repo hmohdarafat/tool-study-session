@@ -1545,6 +1545,24 @@ fn draw_focus_tracker(
         None,
         false,
     );
+    if current_second.is_some_and(|second| second >= FOCUS_TRACKER_SECONDS) {
+        if let Some((level, start_second, end_second)) = least_productive_interval(focus_samples) {
+            write_text(
+                grid,
+                0,
+                stats_y + 1,
+                &format!(
+                    "Least productive: {} to {} ({})",
+                    format_focus_time(start_second),
+                    format_focus_time(end_second),
+                    focus_level_label(level)
+                ),
+                focus_level_color(level),
+                None,
+                false,
+            );
+        }
+    }
 }
 
 fn draw_focus_axis(grid: &mut [Vec<Cell>], graph_y: usize) {
@@ -2187,6 +2205,70 @@ fn focus_level_color(level: FocusLevel) -> Color {
         FocusLevel::Breaking => FOCUS_BREAKING_COLOR,
         FocusLevel::Broken => FOCUS_BROKEN_COLOR,
     }
+}
+
+fn focus_level_label(level: FocusLevel) -> &'static str {
+    match level {
+        FocusLevel::Focused => "Focused",
+        FocusLevel::Breaking => "Breaking",
+        FocusLevel::Broken => "Broken",
+    }
+}
+
+fn least_productive_interval(
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+) -> Option<(FocusLevel, usize, usize)> {
+    let target_level = if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Broken)
+    {
+        FocusLevel::Broken
+    } else if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Breaking)
+    {
+        FocusLevel::Breaking
+    } else if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Focused)
+    {
+        FocusLevel::Focused
+    } else {
+        return None;
+    };
+
+    let mut best_start = 0usize;
+    let mut best_end = 0usize;
+    let mut current_start = None;
+
+    for (second, sample) in focus_samples.iter().enumerate() {
+        if *sample == Some(target_level) {
+            current_start.get_or_insert(second);
+        } else if let Some(start) = current_start.take() {
+            if second - start > best_end.saturating_sub(best_start) {
+                best_start = start;
+                best_end = second;
+            }
+        }
+    }
+
+    if let Some(start) = current_start {
+        if FOCUS_TRACKER_SECONDS - start > best_end.saturating_sub(best_start) {
+            best_start = start;
+            best_end = FOCUS_TRACKER_SECONDS;
+        }
+    }
+
+    Some((target_level, best_start, best_end))
+}
+
+fn format_focus_time(second: usize) -> String {
+    let minutes = second / 60;
+    let seconds = second % 60;
+    format!("{minutes:02}:{seconds:02}")
 }
 
 fn pomodoro_status(pomodoro_start: Option<DateTime<Local>>) -> Option<PomodoroStatus> {
