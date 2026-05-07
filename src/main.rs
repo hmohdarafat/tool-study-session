@@ -83,6 +83,7 @@ const GRADIENT_SPEED: f64 = 24.0;
 const GRADIENT_X_SCALE: f64 = 1.8;
 const GRADIENT_Y_SCALE: f64 = 1.4;
 const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const FOCUS_TINT_TRANSITION_MS: u64 = 1_300;
 
 struct AppState {
     font: FontSetting,
@@ -92,6 +93,8 @@ struct AppState {
     selected_date: NaiveDate,
     pomodoro_start: Option<DateTime<Local>>,
     focus_level: FocusLevel,
+    focus_tint_from: FocusLevel,
+    focus_tint_started_at: Option<Instant>,
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
     selected_noise: Option<NoiseKind>,
@@ -291,6 +294,8 @@ fn main() -> io::Result<()> {
         selected_date: today,
         pomodoro_start: None,
         focus_level: FocusLevel::Focused,
+        focus_tint_from: FocusLevel::Focused,
+        focus_tint_started_at: None,
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
         selected_noise: None,
@@ -377,7 +382,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             state.pomodoro_start = if state.pomodoro_start.is_some() {
                                 None
                             } else {
-                                state.focus_level = FocusLevel::Focused;
+                                set_focus_level(state, FocusLevel::Focused);
                                 state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
                                 state.last_focus_sample_second = None;
                                 Some(Local::now())
@@ -741,7 +746,14 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         calendar_x,
     );
 
-    let mut frame = build_gradient_frame(width as usize, height as usize);
+    let mut frame = build_gradient_frame(
+        width as usize,
+        height as usize,
+        state.focus_tint_from,
+        state.focus_level,
+        state.pomodoro_start.is_some(),
+        focus_tint_progress(state),
+    );
     overlay_grid(
         &mut frame,
         &calendar.grid,
@@ -1063,14 +1075,30 @@ fn trim_grid(grid: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
         .collect()
 }
 
-fn build_gradient_frame(width: usize, height: usize) -> Vec<Vec<Cell>> {
+fn build_gradient_frame(
+    width: usize,
+    height: usize,
+    focus_tint_from: FocusLevel,
+    focus_level: FocusLevel,
+    tint_enabled: bool,
+    tint_progress: f32,
+) -> Vec<Vec<Cell>> {
     (0..height)
         .map(|y| {
             (0..width)
                 .map(|x| Cell {
                     ch: ' ',
                     fg: None,
-                    bg: Some(gradient_color(x, y, width, height)),
+                    bg: Some(gradient_color(
+                        x,
+                        y,
+                        width,
+                        height,
+                        focus_tint_from,
+                        focus_level,
+                        tint_enabled,
+                        tint_progress,
+                    )),
                     crossed: false,
                 })
                 .collect()
@@ -1104,7 +1132,16 @@ fn overlay_grid(frame: &mut [Vec<Cell>], overlay: &[Vec<Cell>], offset_x: usize,
     }
 }
 
-fn gradient_color(x: usize, y: usize, width: usize, height: usize) -> Color {
+fn gradient_color(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    focus_tint_from: FocusLevel,
+    focus_level: FocusLevel,
+    tint_enabled: bool,
+    tint_progress: f32,
+) -> Color {
     let now = Local::now();
     let phase = now.timestamp_millis() as f64 / 1_000.0 / GRADIENT_SPEED;
     let x_ratio = if width > 1 {
@@ -1133,11 +1170,36 @@ fn gradient_color(x: usize, y: usize, width: usize, height: usize) -> Color {
     let red = channel(field, bloom, ember, glow, 6.0, 34.0, 0.11);
     let green = channel(drift, glow, tide, shimmer, 8.0, 30.0, 0.37);
     let blue = channel(shimmer, tide, field, glow, 14.0, 44.0, 0.63);
+    let (red_bias, green_bias, blue_bias) = if tint_enabled {
+        interpolate_bias(
+            focus_background_bias(focus_tint_from),
+            focus_background_bias(focus_level),
+            tint_progress,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
 
     Color::Rgb {
-        r: red,
-        g: green,
-        b: blue,
+        r: ((red as f32 + red_bias).round().clamp(0.0, 255.0)) as u8,
+        g: ((green as f32 + green_bias).round().clamp(0.0, 255.0)) as u8,
+        b: ((blue as f32 + blue_bias).round().clamp(0.0, 255.0)) as u8,
+    }
+}
+
+fn interpolate_bias(from: (f32, f32, f32), to: (f32, f32, f32), progress: f32) -> (f32, f32, f32) {
+    (
+        from.0 + (to.0 - from.0) * progress,
+        from.1 + (to.1 - from.1) * progress,
+        from.2 + (to.2 - from.2) * progress,
+    )
+}
+
+fn focus_background_bias(level: FocusLevel) -> (f32, f32, f32) {
+    match level {
+        FocusLevel::Focused => (0.0, 20.0, 3.0),
+        FocusLevel::Breaking => (30.0, 22.0, 0.0),
+        FocusLevel::Broken => (38.0, 0.0, 0.0),
     }
 }
 
@@ -2106,8 +2168,33 @@ fn record_focus_sample(state: &mut AppState) {
 
 fn set_focus_level(state: &mut AppState, level: FocusLevel) {
     record_focus_sample(state);
+    if state.focus_level != level {
+        state.focus_tint_from = state.focus_level;
+        state.focus_tint_started_at = Some(Instant::now());
+    }
     state.focus_level = level;
     record_focus_sample(state);
+}
+
+fn focus_tint_progress(state: &mut AppState) -> f32 {
+    let Some(started_at) = state.focus_tint_started_at else {
+        return 1.0;
+    };
+
+    let elapsed = started_at.elapsed();
+    let progress = (elapsed.as_secs_f32() / (FOCUS_TINT_TRANSITION_MS as f32 / 1_000.0)).min(1.0);
+    if progress >= 1.0 {
+        state.focus_tint_started_at = None;
+        state.focus_tint_from = state.focus_level;
+        1.0
+    } else {
+        ease_in_out_sine(progress)
+    }
+}
+
+fn ease_in_out_sine(progress: f32) -> f32 {
+    let clamped = progress.clamp(0.0, 1.0);
+    0.5 - 0.5 * (PI as f32 * clamped).cos()
 }
 
 fn focus_elapsed_second(pomodoro_start: Option<DateTime<Local>>) -> Option<usize> {
