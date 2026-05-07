@@ -4,8 +4,13 @@ use std::f64::consts::PI;
 use std::fs;
 use std::io::{self, Stdout, Write, stdout};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
@@ -59,6 +64,9 @@ const START_BUTTON_COLOR: Color = Color::Magenta;
 const QUIT_PROMPT_COLOR: Color = Color::Yellow;
 const POMODORO_STATUS_COLOR: Color = Color::White;
 const POMODORO_INACTIVE_COLOR: Color = Color::Grey;
+const NOISE_LABEL_COLOR: Color = Color::White;
+const NOISE_BUTTON_COLOR: Color = Color::Cyan;
+const NOISE_BUTTON_ACTIVE_BG: Color = Color::DarkBlue;
 const TODO_FILE_NAME: &str = "todos.json";
 const FOCUS_TRACKER_SECONDS: usize = 50 * 60;
 const FOCUS_GRAPH_WIDTH: usize = 50;
@@ -85,6 +93,8 @@ struct AppState {
     focus_level: FocusLevel,
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
+    selected_noise: Option<NoiseKind>,
+    noise_audio: NoiseAudio,
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
     window_fitted: bool,
@@ -105,6 +115,24 @@ struct FontButtons {
     y: u16,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoiseKind {
+    Brown,
+    White,
+    Pink,
+}
+
+struct NoiseButtonHitbox {
+    kind: Option<NoiseKind>,
+    x: u16,
+    end_x: u16,
+}
+
+struct NoiseButtons {
+    y: u16,
+    buttons: Vec<NoiseButtonHitbox>,
+}
+
 struct CalendarButtons {
     month_prev_x: u16,
     month_prev_end: u16,
@@ -119,6 +147,7 @@ struct CalendarButtons {
 
 struct UiControls {
     font: FontButtons,
+    noise: NoiseButtons,
     calendar: CalendarUiControls,
     start: ActionButton,
 }
@@ -141,6 +170,12 @@ struct PomodoroStatus {
     break_countdown: String,
     work_color: Color,
     break_color: Color,
+}
+
+struct NoiseAudio {
+    child: Option<Child>,
+    stop_signal: Option<Arc<AtomicBool>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -252,6 +287,8 @@ fn main() -> io::Result<()> {
         focus_level: FocusLevel::Focused,
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
+        selected_noise: None,
+        noise_audio: NoiseAudio::new(),
         todos: load_todos().unwrap_or_default(),
         editing_todo: None,
         window_fitted: false,
@@ -347,6 +384,16 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 .contains(&mouse.column)
                             {
                                 adjust_font_size(state, 1)?;
+                            }
+                        }
+                        if mouse.row == controls.noise.y {
+                            if let Some(button) = controls
+                                .noise
+                                .buttons
+                                .iter()
+                                .find(|button| (button.x..button.end_x).contains(&mouse.column))
+                            {
+                                select_noise(state, button.kind);
                             }
                         }
                         if mouse.row == controls.calendar.buttons.y {
@@ -496,6 +543,20 @@ fn gradient_poll_interval() -> Duration {
     duration_until_next_minute().min(GRADIENT_REFRESH_INTERVAL)
 }
 
+fn select_noise(state: &mut AppState, kind: Option<NoiseKind>) {
+    match kind {
+        Some(kind) => {
+            if state.noise_audio.play(kind).is_ok() {
+                state.selected_noise = Some(kind);
+            }
+        }
+        None => {
+            state.noise_audio.stop();
+            state.selected_noise = None;
+        }
+    }
+}
+
 fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     record_focus_sample(state);
 
@@ -528,10 +589,11 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         .unwrap_or(0);
     let quit_hint = "Esc = quit  q/w/e = focus";
     let footer_width = quit_hint.len() as u16;
+    let clock_header_rows: u16 = 2;
     if !state.window_fitted {
         let preferred_clock = build_clock(
             preferred_width(make_odd(CLOCK_HEIGHT.min(content_height.max(11)))),
-            content_height,
+            content_height.saturating_sub(clock_header_rows),
             state.pomodoro_start,
         );
         let preferred_content_width =
@@ -547,7 +609,8 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
     let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
-    let origin_y: u16 = 0;
+    let noise_y: u16 = 0;
+    let clock_y: u16 = 2;
     let start_label = if state.pomodoro_start.is_some() {
         "[Stop]"
     } else {
@@ -555,18 +618,19 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     };
     let pomodoro_status = pomodoro_status(state.pomodoro_start);
     let clock_footer_rows = if pomodoro_status.is_some() { 4 } else { 1 };
+    let clock_header_rows = clock_y;
     let available_clock_height = content_height.saturating_sub(clock_footer_rows);
     let mut clock = build_clock(
         available_clock_width,
-        available_clock_height,
+        available_clock_height.saturating_sub(clock_header_rows),
         state.pomodoro_start,
     );
     let mut visible_clock_width = visible_grid_width(&clock);
     let mut clock_height = clock.len() as u16;
     let initial_start_button_y = if pomodoro_status.is_some() {
-        clock_height.saturating_add(4)
+        clock_y + clock_height.saturating_add(4)
     } else {
-        clock_height.saturating_add(1)
+        clock_y + clock_height.saturating_add(1)
     };
     let desired_height = preview_calendar
         .grid
@@ -584,19 +648,19 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         let available_clock_height = content_height.saturating_sub(clock_footer_rows);
         clock = build_clock(
             available_clock_width,
-            available_clock_height,
+            available_clock_height.saturating_sub(clock_header_rows),
             state.pomodoro_start,
         );
         visible_clock_width = visible_grid_width(&clock);
         clock_height = clock.len() as u16;
     }
     state.pending_height_fit = false;
-    let status_phase_y = clock_height.saturating_add(1);
-    let status_countdown_y = clock_height.saturating_add(2);
+    let status_phase_y = clock_y + clock_height.saturating_add(1);
+    let status_countdown_y = clock_y + clock_height.saturating_add(2);
     let start_button_y = if pomodoro_status.is_some() {
-        clock_height.saturating_add(4)
+        clock_y + clock_height.saturating_add(4)
     } else {
-        clock_height.saturating_add(1)
+        clock_y + clock_height.saturating_add(1)
     };
     let start_button = ActionButton {
         x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
@@ -630,9 +694,16 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         &mut frame,
         &calendar.grid,
         calendar_x as usize,
-        origin_y as usize,
+        0,
     );
-    overlay_grid(&mut frame, &clock, clock_x as usize, origin_y as usize);
+    overlay_grid(&mut frame, &clock, clock_x as usize, clock_y as usize);
+    let noise_controls = render_noise_buttons(
+        &mut frame,
+        clock_x,
+        visible_clock_width,
+        noise_y,
+        state.selected_noise,
+    );
     write_text(
         &mut frame,
         font_buttons.minus_x as usize,
@@ -757,6 +828,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     stdout.flush()?;
     Ok(UiControls {
         font: font_buttons,
+        noise: noise_controls,
         calendar: calendar.controls,
         start: start_button,
     })
@@ -780,6 +852,69 @@ fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Re
         thread::sleep(Duration::from_millis(5));
     }
     Ok(())
+}
+
+fn render_noise_buttons(
+    frame: &mut [Vec<Cell>],
+    clock_x: u16,
+    clock_width: u16,
+    y: u16,
+    selected_noise: Option<NoiseKind>,
+) -> NoiseButtons {
+    let label = "Noise (Sandpaper):";
+    let defs = [
+        (None, "[None]"),
+        (Some(NoiseKind::Brown), "[Brown]"),
+        (Some(NoiseKind::White), "[White]"),
+        (Some(NoiseKind::Pink), "[Pink]"),
+    ];
+    let buttons_width = defs
+        .iter()
+        .map(|(_, text)| text.len() as u16)
+        .sum::<u16>()
+        .saturating_add((defs.len().saturating_sub(1) as u16) * 1);
+    let total_width = label.len() as u16 + 1 + buttons_width;
+    let start_x = clock_x + clock_width.saturating_sub(total_width) / 2;
+
+    write_text(
+        frame,
+        start_x as usize,
+        y as usize,
+        label,
+        NOISE_LABEL_COLOR,
+        None,
+        false,
+    );
+
+    let mut cursor_x = start_x + label.len() as u16 + 1;
+    let mut buttons = Vec::new();
+    for (idx, (kind, text)) in defs.iter().enumerate() {
+        let is_selected = selected_noise == *kind;
+        write_text(
+            frame,
+            cursor_x as usize,
+            y as usize,
+            text,
+            NOISE_BUTTON_COLOR,
+            if is_selected {
+                Some(NOISE_BUTTON_ACTIVE_BG)
+            } else {
+                None
+            },
+            false,
+        );
+        buttons.push(NoiseButtonHitbox {
+            kind: *kind,
+            x: cursor_x,
+            end_x: cursor_x + text.len() as u16,
+        });
+        cursor_x += text.len() as u16;
+        if idx + 1 < defs.len() {
+            cursor_x += 1;
+        }
+    }
+
+    NoiseButtons { y, buttons }
 }
 
 fn visible_grid_width(grid: &[Vec<Cell>]) -> u16 {
@@ -1998,6 +2133,124 @@ fn format_countdown(remaining_seconds: i64) -> String {
     let minutes = safe_seconds / 60;
     let seconds = safe_seconds % 60;
     format!("{minutes:02}:{seconds:02}")
+}
+
+impl NoiseAudio {
+    fn new() -> Self {
+        Self {
+            child: None,
+            stop_signal: None,
+            worker: None,
+        }
+    }
+
+    fn play(&mut self, kind: NoiseKind) -> io::Result<()> {
+        self.stop();
+
+        let mut child = Command::new("aplay")
+            .args(["-q", "-t", "raw", "-c", "2", "-r", "44100", "-f", "S16_LE"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let Some(stdin) = child.stdin.take() else {
+            return Err(io::Error::other("audio pipe unavailable"));
+        };
+
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_signal);
+        let worker = thread::spawn(move || {
+            stream_noise(stdin, kind, worker_stop);
+        });
+
+        self.stop_signal = Some(stop_signal);
+        self.worker = Some(worker);
+        self.child = Some(child);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop_signal) = self.stop_signal.take() {
+            stop_signal.store(true, Ordering::Relaxed);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for NoiseAudio {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn stream_noise(mut output: impl Write, kind: NoiseKind, stop: Arc<AtomicBool>) {
+    const FRAME_SAMPLES: usize = 1024;
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    let mut brown = 0.0f32;
+    let mut pink_b0 = 0.0f32;
+    let mut pink_b1 = 0.0f32;
+    let mut pink_b2 = 0.0f32;
+    let mut pink_b3 = 0.0f32;
+    let mut pink_b4 = 0.0f32;
+    let mut pink_b5 = 0.0f32;
+    let mut pink_b6 = 0.0f32;
+    let mut buffer = Vec::with_capacity(FRAME_SAMPLES * 4);
+
+    while !stop.load(Ordering::Relaxed) {
+        buffer.clear();
+        for _ in 0..FRAME_SAMPLES {
+            let white = next_white(&mut rng);
+            let mono = match kind {
+                NoiseKind::White => white * 0.20,
+                NoiseKind::Brown => {
+                    brown = (brown + white * 0.018).clamp(-1.0, 1.0);
+                    brown * 0.42
+                }
+                NoiseKind::Pink => {
+                    pink_b0 = 0.99886 * pink_b0 + white * 0.0555179;
+                    pink_b1 = 0.99332 * pink_b1 + white * 0.0750759;
+                    pink_b2 = 0.96900 * pink_b2 + white * 0.153_852;
+                    pink_b3 = 0.86650 * pink_b3 + white * 0.3104856;
+                    pink_b4 = 0.55000 * pink_b4 + white * 0.5329522;
+                    pink_b5 = -0.7616 * pink_b5 - white * 0.0168980;
+                    let pink = pink_b0
+                        + pink_b1
+                        + pink_b2
+                        + pink_b3
+                        + pink_b4
+                        + pink_b5
+                        + pink_b6
+                        + white * 0.5362;
+                    pink_b6 = white * 0.115926;
+                    pink * 0.08
+                }
+            };
+            let sample = (mono.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            let bytes = sample.to_le_bytes();
+            buffer.extend_from_slice(&bytes);
+            buffer.extend_from_slice(&bytes);
+        }
+
+        if output.write_all(&buffer).is_err() {
+            break;
+        }
+    }
+
+    let _ = output.flush();
+}
+
+fn next_white(rng: &mut u64) -> f32 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    ((*rng as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32
 }
 
 fn write_text(
