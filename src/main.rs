@@ -84,6 +84,7 @@ const GRADIENT_X_SCALE: f64 = 1.8;
 const GRADIENT_Y_SCALE: f64 = 1.4;
 const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const FOCUS_TINT_TRANSITION_MS: u64 = 1_300;
+const POMODORO_TINT_TRANSITION_MS: u64 = 1_000;
 
 struct AppState {
     font: FontSetting,
@@ -95,6 +96,9 @@ struct AppState {
     focus_level: FocusLevel,
     focus_tint_from: FocusLevel,
     focus_tint_started_at: Option<Instant>,
+    pomodoro_tint_from: f32,
+    pomodoro_tint_to: f32,
+    pomodoro_tint_started_at: Option<Instant>,
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
     selected_noise: Option<NoiseKind>,
@@ -296,6 +300,9 @@ fn main() -> io::Result<()> {
         focus_level: FocusLevel::Focused,
         focus_tint_from: FocusLevel::Focused,
         focus_tint_started_at: None,
+        pomodoro_tint_from: 0.0,
+        pomodoro_tint_to: 0.0,
+        pomodoro_tint_started_at: None,
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
         selected_noise: None,
@@ -379,14 +386,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         }
                         KeyCode::Char(' ') => {
                             save_editing_todo(state);
-                            state.pomodoro_start = if state.pomodoro_start.is_some() {
-                                None
-                            } else {
-                                set_focus_level(state, FocusLevel::Focused);
-                                state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
-                                state.last_focus_sample_second = None;
-                                Some(Local::now())
-                            };
+                            toggle_pomodoro(state);
                             state.pending_height_fit = true;
                             controls = render(stdout, state)?;
                         }
@@ -536,14 +536,7 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             && (controls.start.x..controls.start.end_x).contains(&mouse.column)
                         {
                             save_editing_todo(state);
-                            state.pomodoro_start = if state.pomodoro_start.is_some() {
-                                state.last_focus_sample_second = None;
-                                None
-                            } else {
-                                state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
-                                state.last_focus_sample_second = None;
-                                Some(Local::now())
-                            };
+                            toggle_pomodoro(state);
                             state.pending_height_fit = true;
                         }
                         if !keep_editing {
@@ -751,8 +744,8 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         height as usize,
         state.focus_tint_from,
         state.focus_level,
-        state.pomodoro_start.is_some(),
         focus_tint_progress(state),
+        pomodoro_tint_alpha(state),
     );
     overlay_grid(
         &mut frame,
@@ -1080,8 +1073,8 @@ fn build_gradient_frame(
     height: usize,
     focus_tint_from: FocusLevel,
     focus_level: FocusLevel,
-    tint_enabled: bool,
     tint_progress: f32,
+    tint_alpha: f32,
 ) -> Vec<Vec<Cell>> {
     (0..height)
         .map(|y| {
@@ -1096,8 +1089,8 @@ fn build_gradient_frame(
                         height,
                         focus_tint_from,
                         focus_level,
-                        tint_enabled,
                         tint_progress,
+                        tint_alpha,
                     )),
                     crossed: false,
                 })
@@ -1139,8 +1132,8 @@ fn gradient_color(
     height: usize,
     focus_tint_from: FocusLevel,
     focus_level: FocusLevel,
-    tint_enabled: bool,
     tint_progress: f32,
+    tint_alpha: f32,
 ) -> Color {
     let now = Local::now();
     let phase = now.timestamp_millis() as f64 / 1_000.0 / GRADIENT_SPEED;
@@ -1170,15 +1163,15 @@ fn gradient_color(
     let red = channel(field, bloom, ember, glow, 6.0, 34.0, 0.11);
     let green = channel(drift, glow, tide, shimmer, 8.0, 30.0, 0.37);
     let blue = channel(shimmer, tide, field, glow, 14.0, 44.0, 0.63);
-    let (red_bias, green_bias, blue_bias) = if tint_enabled {
+    let (red_bias, green_bias, blue_bias) = interpolate_bias(
+        (0.0, 0.0, 0.0),
         interpolate_bias(
             focus_background_bias(focus_tint_from),
             focus_background_bias(focus_level),
             tint_progress,
-        )
-    } else {
-        (0.0, 0.0, 0.0)
-    };
+        ),
+        tint_alpha,
+    );
 
     Color::Rgb {
         r: ((red as f32 + red_bias).round().clamp(0.0, 255.0)) as u8,
@@ -2176,6 +2169,24 @@ fn set_focus_level(state: &mut AppState, level: FocusLevel) {
     record_focus_sample(state);
 }
 
+fn toggle_pomodoro(state: &mut AppState) {
+    let current_alpha = pomodoro_tint_alpha(state);
+    let was_active = state.pomodoro_start.is_some();
+    state.pomodoro_tint_from = current_alpha;
+    state.pomodoro_tint_to = if was_active { 0.0 } else { 1.0 };
+    state.pomodoro_tint_started_at = Some(Instant::now());
+
+    if was_active {
+        state.pomodoro_start = None;
+        state.last_focus_sample_second = None;
+    } else {
+        set_focus_level(state, FocusLevel::Focused);
+        state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
+        state.last_focus_sample_second = None;
+        state.pomodoro_start = Some(Local::now());
+    }
+}
+
 fn focus_tint_progress(state: &mut AppState) -> f32 {
     let Some(started_at) = state.focus_tint_started_at else {
         return 1.0;
@@ -2192,9 +2203,35 @@ fn focus_tint_progress(state: &mut AppState) -> f32 {
     }
 }
 
+fn pomodoro_tint_alpha(state: &mut AppState) -> f32 {
+    let Some(started_at) = state.pomodoro_tint_started_at else {
+        return state.pomodoro_tint_to;
+    };
+
+    let elapsed = started_at.elapsed();
+    let progress =
+        (elapsed.as_secs_f32() / (POMODORO_TINT_TRANSITION_MS as f32 / 1_000.0)).min(1.0);
+    if progress >= 1.0 {
+        state.pomodoro_tint_started_at = None;
+        state.pomodoro_tint_from = state.pomodoro_tint_to;
+        state.pomodoro_tint_to = state.pomodoro_tint_from;
+        state.pomodoro_tint_from
+    } else {
+        interpolate_scalar(
+            state.pomodoro_tint_from,
+            state.pomodoro_tint_to,
+            ease_in_out_sine(progress),
+        )
+    }
+}
+
 fn ease_in_out_sine(progress: f32) -> f32 {
     let clamped = progress.clamp(0.0, 1.0);
     0.5 - 0.5 * (PI as f32 * clamped).cos()
+}
+
+fn interpolate_scalar(from: f32, to: f32, progress: f32) -> f32 {
+    from + (to - from) * progress
 }
 
 fn focus_elapsed_second(pomodoro_start: Option<DateTime<Local>>) -> Option<usize> {
