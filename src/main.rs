@@ -2201,19 +2201,28 @@ fn set_focus_level(state: &mut AppState, level: FocusLevel) {
 }
 
 fn current_background_focus_bias(state: &mut AppState) -> (f32, f32, f32) {
-    if let Some(loop_mix) = past_window_loop_mix(state) {
-        return interpolate_bias(
-            focus_background_bias(FocusLevel::Focused),
-            focus_background_bias(FocusLevel::Broken),
-            loop_mix,
-        );
-    }
-
-    interpolate_bias(
+    let tint_progress = focus_tint_progress(state);
+    let live_bias = interpolate_bias(
         focus_background_bias(state.focus_tint_from),
         focus_background_bias(state.focus_level),
-        focus_tint_progress(state),
-    )
+        tint_progress,
+    );
+
+    if tint_progress < 1.0 {
+        return live_bias;
+    }
+
+    if state.focus_level == FocusLevel::Focused {
+        if let Some(loop_mix) = past_window_loop_mix(state) {
+            return interpolate_bias(
+                focus_background_bias(FocusLevel::Focused),
+                focus_background_bias(FocusLevel::Broken),
+                loop_mix,
+            );
+        }
+    }
+
+    live_bias
 }
 
 fn toggle_pomodoro_session(state: &mut AppState) -> io::Result<()> {
