@@ -335,6 +335,13 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     let mut controls = render(stdout, state)?;
 
     loop {
+        if pomodoro_finished(state.pomodoro_start) {
+            toggle_pomodoro(state);
+            state.pending_height_fit = true;
+            controls = render(stdout, state)?;
+            continue;
+        }
+
         if event::poll(gradient_poll_interval())? {
             match event::read()? {
                 Event::Key(key) => {
@@ -2433,6 +2440,14 @@ fn format_countdown(remaining_seconds: i64) -> String {
     let minutes = safe_seconds / 60;
     let seconds = safe_seconds % 60;
     format!("{minutes:02}:{seconds:02}")
+}
+
+fn pomodoro_finished(pomodoro_start: Option<DateTime<Local>>) -> bool {
+    let Some(start) = pomodoro_start else {
+        return false;
+    };
+
+    Local::now().signed_duration_since(start).num_seconds().max(0) >= 60 * 60
 }
 
 impl NoiseAudio {
