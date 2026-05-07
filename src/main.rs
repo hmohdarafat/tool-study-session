@@ -67,6 +67,7 @@ const POMODORO_INACTIVE_COLOR: Color = Color::Grey;
 const NOISE_LABEL_COLOR: Color = Color::White;
 const NOISE_BUTTON_COLOR: Color = Color::Cyan;
 const NOISE_BUTTON_ACTIVE_BG: Color = Color::DarkBlue;
+const NOISE_VOLUME_COLOR: Color = Color::White;
 const TODO_FILE_NAME: &str = "todos.json";
 const FOCUS_TRACKER_SECONDS: usize = 50 * 60;
 const FOCUS_GRAPH_WIDTH: usize = 50;
@@ -94,6 +95,7 @@ struct AppState {
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
     selected_noise: Option<NoiseKind>,
+    noise_volume: u8,
     noise_audio: NoiseAudio,
     todos: HashMap<NaiveDate, Vec<TodoItem>>,
     editing_todo: Option<EditingTodo>,
@@ -131,6 +133,10 @@ struct NoiseButtonHitbox {
 struct NoiseButtons {
     y: u16,
     buttons: Vec<NoiseButtonHitbox>,
+    volume_down_x: u16,
+    volume_down_end_x: u16,
+    volume_up_x: u16,
+    volume_up_end_x: u16,
 }
 
 struct CalendarButtons {
@@ -288,6 +294,7 @@ fn main() -> io::Result<()> {
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
         selected_noise: None,
+        noise_volume: 50,
         noise_audio: NoiseAudio::new(),
         todos: load_todos().unwrap_or_default(),
         editing_todo: None,
@@ -365,6 +372,19 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                             adjust_font_size(state, 1)?;
                             controls = render(stdout, state)?;
                         }
+                        KeyCode::Char(' ') => {
+                            save_editing_todo(state);
+                            state.pomodoro_start = if state.pomodoro_start.is_some() {
+                                None
+                            } else {
+                                state.focus_level = FocusLevel::Focused;
+                                state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
+                                state.last_focus_sample_second = None;
+                                Some(Local::now())
+                            };
+                            state.pending_height_fit = true;
+                            controls = render(stdout, state)?;
+                        }
                         _ => {}
                     }
                 }
@@ -394,6 +414,16 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                                 .find(|button| (button.x..button.end_x).contains(&mouse.column))
                             {
                                 select_noise(state, button.kind);
+                            } else if (controls.noise.volume_down_x
+                                ..controls.noise.volume_down_end_x)
+                                .contains(&mouse.column)
+                            {
+                                adjust_noise_volume(state, -1);
+                            } else if (controls.noise.volume_up_x
+                                ..controls.noise.volume_up_end_x)
+                                .contains(&mouse.column)
+                            {
+                                adjust_noise_volume(state, 1);
                             }
                         }
                         if mouse.row == controls.calendar.buttons.y {
@@ -546,7 +576,12 @@ fn gradient_poll_interval() -> Duration {
 fn select_noise(state: &mut AppState, kind: Option<NoiseKind>) {
     match kind {
         Some(kind) => {
-            if state.noise_audio.play(kind).is_ok() {
+            state.noise_volume = 0;
+            if state
+                .noise_audio
+                .play(kind, state.noise_volume as f32 / 100.0)
+                .is_ok()
+            {
                 state.selected_noise = Some(kind);
             }
         }
@@ -554,6 +589,20 @@ fn select_noise(state: &mut AppState, kind: Option<NoiseKind>) {
             state.noise_audio.stop();
             state.selected_noise = None;
         }
+    }
+}
+
+fn adjust_noise_volume(state: &mut AppState, delta: i16) {
+    let next = (state.noise_volume as i16 + delta).clamp(0, 100) as u8;
+    if next == state.noise_volume {
+        return;
+    }
+
+    state.noise_volume = next;
+    if let Some(kind) = state.selected_noise {
+        let _ = state
+            .noise_audio
+            .play(kind, state.noise_volume as f32 / 100.0);
     }
 }
 
@@ -596,8 +645,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
             content_height.saturating_sub(clock_header_rows),
             state.pomodoro_start,
         );
-        let preferred_content_width =
-            calendar_width + PANEL_GAP + visible_grid_width(&preferred_clock);
+        let preferred_clock_block_width =
+            visible_grid_width(&preferred_clock).max(noise_controls_width(state.noise_volume));
+        let preferred_content_width = calendar_width + PANEL_GAP + preferred_clock_block_width;
         let preferred_total_width = preferred_content_width.max(footer_width);
         request_terminal_size(stdout, preferred_total_width, height)?;
         let (new_width, new_height) = terminal::size()?;
@@ -703,6 +753,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         visible_clock_width,
         noise_y,
         state.selected_noise,
+        state.noise_volume,
     );
     write_text(
         &mut frame,
@@ -854,12 +905,25 @@ fn request_terminal_size(stdout: &mut Stdout, width: u16, height: u16) -> io::Re
     Ok(())
 }
 
+fn noise_controls_width(noise_volume: u8) -> u16 {
+    let label = "Noise (Sandpaper):";
+    let volume_label = format!("Vol [-] {:>3}% [+]", noise_volume);
+    let button_labels = ["[None]", "[Brown]", "[White]", "[Pink]"];
+    let buttons_width = button_labels
+        .iter()
+        .map(|text| text.len() as u16)
+        .sum::<u16>()
+        .saturating_add((button_labels.len().saturating_sub(1) as u16) * 1);
+    volume_label.len() as u16 + 1 + label.len() as u16 + 1 + buttons_width
+}
+
 fn render_noise_buttons(
     frame: &mut [Vec<Cell>],
     clock_x: u16,
     clock_width: u16,
     y: u16,
     selected_noise: Option<NoiseKind>,
+    noise_volume: u8,
 ) -> NoiseButtons {
     let label = "Noise (Sandpaper):";
     let defs = [
@@ -868,17 +932,38 @@ fn render_noise_buttons(
         (Some(NoiseKind::White), "[White]"),
         (Some(NoiseKind::Pink), "[Pink]"),
     ];
+    let volume_label = format!("Vol [-] {:>3}% [+]", noise_volume);
     let buttons_width = defs
         .iter()
         .map(|(_, text)| text.len() as u16)
         .sum::<u16>()
         .saturating_add((defs.len().saturating_sub(1) as u16) * 1);
-    let total_width = label.len() as u16 + 1 + buttons_width;
+    let total_width = volume_label.len() as u16
+        + 1
+        + label.len() as u16
+        + 1
+        + buttons_width
+        ;
     let start_x = clock_x + clock_width.saturating_sub(total_width) / 2;
 
     write_text(
         frame,
         start_x as usize,
+        y as usize,
+        &volume_label,
+        NOISE_VOLUME_COLOR,
+        None,
+        false,
+    );
+    let volume_down_x = start_x + 4;
+    let volume_down_end_x = volume_down_x + 3;
+    let volume_up_x = start_x + volume_label.len() as u16 - 3;
+    let volume_up_end_x = volume_up_x + 3;
+
+    let label_x = start_x + volume_label.len() as u16 + 1;
+    write_text(
+        frame,
+        label_x as usize,
         y as usize,
         label,
         NOISE_LABEL_COLOR,
@@ -886,7 +971,7 @@ fn render_noise_buttons(
         false,
     );
 
-    let mut cursor_x = start_x + label.len() as u16 + 1;
+    let mut cursor_x = label_x + label.len() as u16 + 1;
     let mut buttons = Vec::new();
     for (idx, (kind, text)) in defs.iter().enumerate() {
         let is_selected = selected_noise == *kind;
@@ -914,7 +999,14 @@ fn render_noise_buttons(
         }
     }
 
-    NoiseButtons { y, buttons }
+    NoiseButtons {
+        y,
+        buttons,
+        volume_down_x,
+        volume_down_end_x,
+        volume_up_x,
+        volume_up_end_x,
+    }
 }
 
 fn visible_grid_width(grid: &[Vec<Cell>]) -> u16 {
@@ -2144,7 +2236,7 @@ impl NoiseAudio {
         }
     }
 
-    fn play(&mut self, kind: NoiseKind) -> io::Result<()> {
+    fn play(&mut self, kind: NoiseKind, volume: f32) -> io::Result<()> {
         self.stop();
 
         let mut child = Command::new("aplay")
@@ -2161,7 +2253,7 @@ impl NoiseAudio {
         let stop_signal = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_signal);
         let worker = thread::spawn(move || {
-            stream_noise(stdin, kind, worker_stop);
+            stream_noise(stdin, kind, volume, worker_stop);
         });
 
         self.stop_signal = Some(stop_signal);
@@ -2190,7 +2282,7 @@ impl Drop for NoiseAudio {
     }
 }
 
-fn stream_noise(mut output: impl Write, kind: NoiseKind, stop: Arc<AtomicBool>) {
+fn stream_noise(mut output: impl Write, kind: NoiseKind, volume: f32, stop: Arc<AtomicBool>) {
     const FRAME_SAMPLES: usize = 1024;
     let mut rng: u64 = 0x1234_5678_9abc_def0;
     let mut brown = 0.0f32;
@@ -2232,7 +2324,7 @@ fn stream_noise(mut output: impl Write, kind: NoiseKind, stop: Arc<AtomicBool>) 
                     pink * 0.08
                 }
             };
-            let sample = (mono.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            let sample = ((mono * volume).clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             let bytes = sample.to_le_bytes();
             buffer.extend_from_slice(&bytes);
             buffer.extend_from_slice(&bytes);
