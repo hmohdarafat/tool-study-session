@@ -240,10 +240,14 @@ struct LeastProductiveSummary {
     end_second: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SavedFocusPattern {
-    LeastProductiveWindow(LeastProductiveWindow),
+    LeastProductiveWindows(Vec<LeastProductiveWindow>),
     RemainingWorkWindow { start_second: usize },
+    LeastProductiveWindowsAndRemainingWork {
+        windows: Vec<LeastProductiveWindow>,
+        start_second: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,8 +269,15 @@ enum StoredSavedFocusPattern {
         start_second: usize,
         end_second: usize,
     },
+    LeastProductiveWindows {
+        windows: Vec<StoredLeastProductiveWindow>,
+    },
     FullWorkLoop,
     RemainingWorkWindow {
+        start_second: usize,
+    },
+    LeastProductiveWindowsAndRemainingWork {
+        windows: Vec<StoredLeastProductiveWindow>,
         start_second: usize,
     },
 }
@@ -2320,12 +2331,18 @@ fn stop_pomodoro_session_manually(state: &mut AppState) -> io::Result<()> {
                 end_second,
             }
         });
-    if let Some(second) = focus_elapsed_second(state.pomodoro_start).filter(|second| *second < 50 * 60) {
-        state.saved_focus_pattern = Some(SavedFocusPattern::RemainingWorkWindow {
-            start_second: second,
-        });
-        save_focus_memory(state.saved_focus_pattern)?;
-    }
+    let least_windows = least_productive_windows(&state.focus_samples).unwrap_or_default();
+    let remaining_start = focus_elapsed_second(state.pomodoro_start).filter(|second| *second < 50 * 60);
+    state.saved_focus_pattern = match (least_windows.is_empty(), remaining_start) {
+        (false, Some(start_second)) => Some(SavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+            windows: least_windows,
+            start_second,
+        }),
+        (false, None) => Some(SavedFocusPattern::LeastProductiveWindows(least_windows)),
+        (true, Some(start_second)) => Some(SavedFocusPattern::RemainingWorkWindow { start_second }),
+        (true, None) => None,
+    };
+    save_focus_memory(state.saved_focus_pattern.clone())?;
     stop_pomodoro_session(state)
 }
 
@@ -2339,14 +2356,10 @@ fn complete_pomodoro_session(state: &mut AppState) -> io::Result<()> {
                 end_second,
             }
         });
-    state.saved_focus_pattern =
-        least_productive_interval(&state.focus_samples).map(|(_, start_second, end_second)| {
-            SavedFocusPattern::LeastProductiveWindow(LeastProductiveWindow {
-                start_second,
-                end_second,
-            })
-        });
-    save_focus_memory(state.saved_focus_pattern)?;
+    state.saved_focus_pattern = least_productive_windows(&state.focus_samples)
+        .filter(|windows| !windows.is_empty())
+        .map(SavedFocusPattern::LeastProductiveWindows);
+    save_focus_memory(state.saved_focus_pattern.clone())?;
     stop_pomodoro_session(state)?;
     Ok(())
 }
@@ -2399,7 +2412,7 @@ fn interpolate_scalar(from: f32, to: f32, progress: f32) -> f32 {
 }
 
 fn past_window_loop_mix(state: &AppState) -> Option<f32> {
-    let pattern = state.saved_focus_pattern?;
+    let pattern = state.saved_focus_pattern.as_ref()?;
     let start = state.pomodoro_start?;
     let elapsed_seconds = Local::now().signed_duration_since(start).num_milliseconds() as f32 / 1_000.0;
     if elapsed_seconds < 0.0 {
@@ -2407,17 +2420,31 @@ fn past_window_loop_mix(state: &AppState) -> Option<f32> {
     }
     let current_second = elapsed_seconds.floor() as usize;
     let loop_elapsed = match pattern {
-        SavedFocusPattern::LeastProductiveWindow(window) => {
-            if current_second < window.start_second || current_second >= window.end_second {
-                return None;
-            }
+        SavedFocusPattern::LeastProductiveWindows(windows) => {
+            let window = windows.iter().find(|window| {
+                current_second >= window.start_second && current_second < window.end_second
+            })?;
             elapsed_seconds - window.start_second as f32
         }
         SavedFocusPattern::RemainingWorkWindow { start_second } => {
-            if current_second < start_second || current_second >= 50 * 60 {
+            if current_second < *start_second || current_second >= 50 * 60 {
                 return None;
             }
-            elapsed_seconds - start_second as f32
+            elapsed_seconds - *start_second as f32
+        }
+        SavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+            windows,
+            start_second,
+        } => {
+            if let Some(window) = windows.iter().find(|window| {
+                current_second >= window.start_second && current_second < window.end_second
+            }) {
+                elapsed_seconds - window.start_second as f32
+            } else if current_second >= *start_second && current_second < 50 * 60 {
+                elapsed_seconds - *start_second as f32
+            } else {
+                return None;
+            }
         }
     };
     let phase = loop_elapsed / PAST_WINDOW_LOOP_SECONDS;
@@ -2550,27 +2577,7 @@ fn focus_level_label(level: FocusLevel) -> &'static str {
 fn least_productive_interval(
     focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
 ) -> Option<(FocusLevel, usize, usize)> {
-    let target_level = if focus_samples
-        .iter()
-        .flatten()
-        .any(|level| *level == FocusLevel::Broken)
-    {
-        FocusLevel::Broken
-    } else if focus_samples
-        .iter()
-        .flatten()
-        .any(|level| *level == FocusLevel::Breaking)
-    {
-        FocusLevel::Breaking
-    } else if focus_samples
-        .iter()
-        .flatten()
-        .any(|level| *level == FocusLevel::Focused)
-    {
-        FocusLevel::Focused
-    } else {
-        return None;
-    };
+    let target_level = least_productive_level(focus_samples)?;
 
     let mut best_start = 0usize;
     let mut best_end = 0usize;
@@ -2595,6 +2602,63 @@ fn least_productive_interval(
     }
 
     Some((target_level, best_start, best_end))
+}
+
+fn least_productive_windows(
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+) -> Option<Vec<LeastProductiveWindow>> {
+    let target_level = least_productive_level(focus_samples)?;
+    if matches!(target_level, FocusLevel::Focused) {
+        return None;
+    }
+    let mut windows = Vec::new();
+    let mut current_start = None;
+
+    for (second, sample) in focus_samples.iter().enumerate() {
+        if *sample == Some(target_level) {
+            current_start.get_or_insert(second);
+        } else if let Some(start_second) = current_start.take() {
+            windows.push(LeastProductiveWindow {
+                start_second,
+                end_second: second,
+            });
+        }
+    }
+
+    if let Some(start_second) = current_start {
+        windows.push(LeastProductiveWindow {
+            start_second,
+            end_second: FOCUS_TRACKER_SECONDS,
+        });
+    }
+
+    Some(windows)
+}
+
+fn least_productive_level(
+    focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+) -> Option<FocusLevel> {
+    if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Broken)
+    {
+        Some(FocusLevel::Broken)
+    } else if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Breaking)
+    {
+        Some(FocusLevel::Breaking)
+    } else if focus_samples
+        .iter()
+        .flatten()
+        .any(|level| *level == FocusLevel::Focused)
+    {
+        Some(FocusLevel::Focused)
+    } else {
+        None
+    }
 }
 
 fn format_focus_time(second: usize) -> String {
@@ -3027,17 +3091,51 @@ fn load_focus_memory() -> io::Result<Option<SavedFocusPattern>> {
     let stored: StoredFocusMemory = serde_json::from_str(&raw)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
+    let decode_windows = |windows: Vec<StoredLeastProductiveWindow>| {
+        windows
+            .into_iter()
+            .filter(|window| {
+                window.start_second < window.end_second
+                    && window.end_second <= FOCUS_TRACKER_SECONDS
+            })
+            .map(|window| LeastProductiveWindow {
+                start_second: window.start_second,
+                end_second: window.end_second,
+            })
+            .collect::<Vec<_>>()
+    };
+
     Ok(match stored.pattern {
+        Some(StoredSavedFocusPattern::LeastProductiveWindows { windows }) => {
+            let windows = decode_windows(windows);
+            if windows.is_empty() {
+                None
+            } else {
+                Some(SavedFocusPattern::LeastProductiveWindows(windows))
+            }
+        }
+        Some(StoredSavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+            windows,
+            start_second,
+        }) if start_second < 50 * 60 => {
+            let windows = decode_windows(windows);
+            if windows.is_empty() {
+                Some(SavedFocusPattern::RemainingWorkWindow { start_second })
+            } else {
+                Some(SavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+                    windows,
+                    start_second,
+                })
+            }
+        }
         Some(StoredSavedFocusPattern::LeastProductiveWindow {
             start_second,
             end_second,
         }) if start_second < end_second && end_second <= FOCUS_TRACKER_SECONDS => {
-            Some(SavedFocusPattern::LeastProductiveWindow(
-                LeastProductiveWindow {
-                    start_second,
-                    end_second,
-                },
-            ))
+            Some(SavedFocusPattern::LeastProductiveWindows(vec![LeastProductiveWindow {
+                start_second,
+                end_second,
+            }]))
         }
         Some(StoredSavedFocusPattern::RemainingWorkWindow { start_second })
             if start_second < 50 * 60 =>
@@ -3050,12 +3148,12 @@ fn load_focus_memory() -> io::Result<Option<SavedFocusPattern>> {
         _ => stored.least_productive_window.and_then(|window| {
             if window.start_second < window.end_second && window.end_second <= FOCUS_TRACKER_SECONDS
             {
-                Some(SavedFocusPattern::LeastProductiveWindow(
+                Some(SavedFocusPattern::LeastProductiveWindows(vec![
                     LeastProductiveWindow {
                         start_second: window.start_second,
                         end_second: window.end_second,
                     },
-                ))
+                ]))
             } else {
                 None
             }
@@ -3066,15 +3164,33 @@ fn load_focus_memory() -> io::Result<Option<SavedFocusPattern>> {
 fn save_focus_memory(pattern: Option<SavedFocusPattern>) -> io::Result<()> {
     let payload = StoredFocusMemory {
         pattern: pattern.map(|pattern| match pattern {
-            SavedFocusPattern::LeastProductiveWindow(window) => {
-                StoredSavedFocusPattern::LeastProductiveWindow {
-                    start_second: window.start_second,
-                    end_second: window.end_second,
+            SavedFocusPattern::LeastProductiveWindows(windows) => {
+                StoredSavedFocusPattern::LeastProductiveWindows {
+                    windows: windows
+                        .into_iter()
+                        .map(|window| StoredLeastProductiveWindow {
+                            start_second: window.start_second,
+                            end_second: window.end_second,
+                        })
+                        .collect(),
                 }
             }
             SavedFocusPattern::RemainingWorkWindow { start_second } => {
                 StoredSavedFocusPattern::RemainingWorkWindow { start_second }
             }
+            SavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+                windows,
+                start_second,
+            } => StoredSavedFocusPattern::LeastProductiveWindowsAndRemainingWork {
+                windows: windows
+                    .into_iter()
+                    .map(|window| StoredLeastProductiveWindow {
+                        start_second: window.start_second,
+                        end_second: window.end_second,
+                    })
+                    .collect(),
+                start_second,
+            },
         }),
         least_productive_window: None,
     };
