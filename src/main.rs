@@ -85,6 +85,7 @@ const GRADIENT_X_SCALE: f64 = 1.8;
 const GRADIENT_Y_SCALE: f64 = 1.4;
 const GRADIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const FOCUS_TINT_TRANSITION_MS: u64 = 1_300;
+const MEMORY_LOOP_HANDOFF_MS: u64 = 900;
 const POMODORO_TINT_TRANSITION_MS: u64 = 1_000;
 const POMODORO_TINT_MAX_ALPHA: f32 = 0.58;
 const PAST_WINDOW_LOOP_SECONDS: f32 = 3.2;
@@ -102,6 +103,7 @@ struct AppState {
     focus_level: FocusLevel,
     focus_tint_from: FocusLevel,
     focus_tint_started_at: Option<Instant>,
+    memory_loop_handoff_started_at: Option<Instant>,
     pomodoro_tint_from: f32,
     pomodoro_tint_to: f32,
     pomodoro_tint_started_at: Option<Instant>,
@@ -352,6 +354,7 @@ fn main() -> io::Result<()> {
         focus_level: FocusLevel::Focused,
         focus_tint_from: FocusLevel::Focused,
         focus_tint_started_at: None,
+        memory_loop_handoff_started_at: None,
         pomodoro_tint_from: 0.0,
         pomodoro_tint_to: 0.0,
         pomodoro_tint_started_at: None,
@@ -2226,6 +2229,11 @@ fn set_focus_level(state: &mut AppState, level: FocusLevel) {
     if state.focus_level != level {
         state.focus_tint_from = state.focus_level;
         state.focus_tint_started_at = Some(Instant::now());
+        state.memory_loop_handoff_started_at = if level == FocusLevel::Focused {
+            Some(Instant::now())
+        } else {
+            None
+        };
     }
     state.focus_level = level;
     record_focus_sample(state);
@@ -2245,11 +2253,13 @@ fn current_background_focus_bias(state: &mut AppState) -> (f32, f32, f32) {
 
     if state.focus_level == FocusLevel::Focused {
         if let Some(loop_mix) = past_window_loop_mix(state) {
-            return interpolate_bias(
+            let loop_bias = interpolate_bias(
                 MEMORY_LOOP_FOCUSED_BIAS,
                 MEMORY_LOOP_BROKEN_BIAS,
                 loop_mix,
             );
+            let handoff_progress = memory_loop_handoff_progress(state);
+            return interpolate_bias(live_bias, loop_bias, handoff_progress);
         }
     }
 
@@ -2412,6 +2422,22 @@ fn past_window_loop_mix(state: &AppState) -> Option<f32> {
     };
     let phase = loop_elapsed / PAST_WINDOW_LOOP_SECONDS;
     Some(0.5 - 0.5 * (2.0 * PI as f32 * phase).cos())
+}
+
+fn memory_loop_handoff_progress(state: &mut AppState) -> f32 {
+    let Some(started_at) = state.memory_loop_handoff_started_at else {
+        return 1.0;
+    };
+
+    let elapsed = started_at.elapsed();
+    let progress =
+        (elapsed.as_secs_f32() / (MEMORY_LOOP_HANDOFF_MS as f32 / 1_000.0)).min(1.0);
+    if progress >= 1.0 {
+        state.memory_loop_handoff_started_at = None;
+        1.0
+    } else {
+        ease_in_out_sine(progress)
+    }
 }
 
 fn focus_elapsed_second(pomodoro_start: Option<DateTime<Local>>) -> Option<usize> {
