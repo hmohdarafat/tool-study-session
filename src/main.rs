@@ -667,25 +667,31 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         "[Start]"
     };
     let pomodoro_status = pomodoro_status(state.pomodoro_start);
-    let clock_footer_rows = if pomodoro_status.is_some() { 4 } else { 1 };
     let clock_header_rows = clock_y;
-    let available_clock_height = content_height.saturating_sub(clock_footer_rows);
+    let preferred_clock = build_clock(
+        preferred_width(make_odd(CLOCK_HEIGHT)),
+        CLOCK_HEIGHT,
+        state.pomodoro_start,
+    );
+    let preferred_clock_height = preferred_clock.len() as u16;
+    let available_clock_height = content_height.saturating_sub(clock_header_rows);
     let mut clock = build_clock(
         available_clock_width,
-        available_clock_height.saturating_sub(clock_header_rows),
+        available_clock_height,
         state.pomodoro_start,
     );
     let mut visible_clock_width = visible_grid_width(&clock);
     let mut clock_height = clock.len() as u16;
-    let initial_start_button_y = if pomodoro_status.is_some() {
-        clock_y + clock_height.saturating_add(4)
+    let initial_start_button_y = clock_y + preferred_clock_height.saturating_add(1);
+    let initial_status_countdown_y = if pomodoro_status.is_some() {
+        initial_start_button_y.saturating_add(3)
     } else {
-        clock_y + clock_height.saturating_add(1)
+        initial_start_button_y
     };
     let desired_height = preview_calendar
         .grid
         .len()
-        .max((initial_start_button_y as usize).saturating_add(1))
+        .max((initial_status_countdown_y as usize).saturating_add(1))
         .saturating_add(1) as u16;
     if state.pending_height_fit && height != desired_height {
         request_terminal_size(stdout, width, desired_height)?;
@@ -695,23 +701,19 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
 
         let content_height = height.saturating_sub(2);
         let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
-        let available_clock_height = content_height.saturating_sub(clock_footer_rows);
+        let available_clock_height = content_height.saturating_sub(clock_header_rows);
         clock = build_clock(
             available_clock_width,
-            available_clock_height.saturating_sub(clock_header_rows),
+            available_clock_height,
             state.pomodoro_start,
         );
         visible_clock_width = visible_grid_width(&clock);
         clock_height = clock.len() as u16;
     }
     state.pending_height_fit = false;
-    let status_phase_y = clock_y + clock_height.saturating_add(1);
-    let status_countdown_y = clock_y + clock_height.saturating_add(2);
-    let start_button_y = if pomodoro_status.is_some() {
-        clock_y + clock_height.saturating_add(4)
-    } else {
-        clock_y + clock_height.saturating_add(1)
-    };
+    let start_button_y = clock_y + clock_height.saturating_add(1);
+    let status_phase_y = start_button_y.saturating_add(2);
+    let status_countdown_y = start_button_y.saturating_add(3);
     let start_button = ActionButton {
         x: clock_x + visible_clock_width.saturating_sub(start_label.len() as u16) / 2,
         end_x: clock_x
