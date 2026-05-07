@@ -88,6 +88,9 @@ const FOCUS_TINT_TRANSITION_MS: u64 = 1_300;
 const POMODORO_TINT_TRANSITION_MS: u64 = 1_000;
 const POMODORO_TINT_MAX_ALPHA: f32 = 0.58;
 const PAST_WINDOW_LOOP_SECONDS: f32 = 3.2;
+const MEMORY_LOOP_ALPHA_BOOST: f32 = 0.10;
+const MEMORY_LOOP_FOCUSED_BIAS: (f32, f32, f32) = (0.0, 20.0, 3.0);
+const MEMORY_LOOP_BROKEN_BIAS: (f32, f32, f32) = (52.0, 0.0, 0.0);
 
 struct AppState {
     font: FontSetting,
@@ -104,6 +107,7 @@ struct AppState {
     pomodoro_tint_started_at: Option<Instant>,
     focus_samples: [Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
     last_focus_sample_second: Option<usize>,
+    last_session_least_productive: Option<LeastProductiveSummary>,
     saved_focus_pattern: Option<SavedFocusPattern>,
     selected_noise: Option<NoiseKind>,
     noise_volume: u8,
@@ -228,9 +232,16 @@ struct LeastProductiveWindow {
 }
 
 #[derive(Clone, Copy)]
+struct LeastProductiveSummary {
+    level: FocusLevel,
+    start_second: usize,
+    end_second: usize,
+}
+
+#[derive(Clone, Copy)]
 enum SavedFocusPattern {
     LeastProductiveWindow(LeastProductiveWindow),
-    FullWorkLoop,
+    RemainingWorkWindow { start_second: usize },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,6 +264,9 @@ enum StoredSavedFocusPattern {
         end_second: usize,
     },
     FullWorkLoop,
+    RemainingWorkWindow {
+        start_second: usize,
+    },
 }
 
 struct TodoItem {
@@ -343,6 +357,7 @@ fn main() -> io::Result<()> {
         pomodoro_tint_started_at: None,
         focus_samples: [None; FOCUS_TRACKER_SECONDS],
         last_focus_sample_second: None,
+        last_session_least_productive: None,
         saved_focus_pattern: load_focus_memory().ok().flatten(),
         selected_noise: None,
         noise_volume: 50,
@@ -664,6 +679,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         state.pomodoro_start,
         state.focus_level,
         &state.focus_samples,
+        state.last_session_least_productive,
         0,
     );
     let minimum_height = (preview_calendar.grid.len() as u16).saturating_add(2);
@@ -782,6 +798,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         state.pomodoro_start,
         state.focus_level,
         &state.focus_samples,
+        state.last_session_least_productive,
         calendar_x,
     );
 
@@ -789,7 +806,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         width as usize,
         height as usize,
         current_background_focus_bias(state),
-        pomodoro_tint_alpha(state),
+        current_background_tint_alpha(state),
     );
     overlay_grid(
         &mut frame,
@@ -1291,13 +1308,14 @@ fn build_calendar_panel(
     pomodoro_start: Option<DateTime<Local>>,
     focus_level: FocusLevel,
     focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+    last_session_least_productive: Option<LeastProductiveSummary>,
     calendar_x: u16,
 ) -> CalendarPanel {
     let width = 58usize;
     let text_x = 6usize;
     let text_width = width.saturating_sub(text_x + 1);
     let year_x = 14usize;
-    let focus_rows = 23usize;
+    let focus_rows = 24usize;
     let todo_rows = todos
         .map(|items| {
             items
@@ -1514,6 +1532,7 @@ fn build_calendar_panel(
         pomodoro_start,
         focus_level,
         focus_samples,
+        last_session_least_productive,
         &mut focus_button_hits,
     );
 
@@ -1538,6 +1557,7 @@ fn draw_focus_tracker(
     pomodoro_start: Option<DateTime<Local>>,
     focus_level: FocusLevel,
     focus_samples: &[Option<FocusLevel>; FOCUS_TRACKER_SECONDS],
+    last_session_least_productive: Option<LeastProductiveSummary>,
     focus_button_hits: &mut Vec<FocusButtonHitbox>,
 ) {
     let buttons_y = start_y + 2;
@@ -1633,23 +1653,34 @@ fn draw_focus_tracker(
         None,
         false,
     );
-    if current_second.is_some_and(|second| second >= FOCUS_TRACKER_SECONDS) {
-        if let Some((level, start_second, end_second)) = least_productive_interval(focus_samples) {
-            write_text(
-                grid,
-                0,
-                stats_y + 1,
-                &format!(
-                    "Least productive: {} to {} ({})",
-                    format_focus_time(start_second),
-                    format_focus_time(end_second),
-                    focus_level_label(level)
-                ),
-                focus_level_color(level),
-                None,
-                false,
-            );
-        }
+    let least_productive = if current_second.is_none() {
+        last_session_least_productive
+    } else if current_second.is_some_and(|second| second >= FOCUS_TRACKER_SECONDS) {
+        least_productive_interval(focus_samples).map(|(level, start_second, end_second)| {
+            LeastProductiveSummary {
+                level,
+                start_second,
+                end_second,
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(summary) = least_productive {
+        write_text(
+            grid,
+            0,
+            stats_y + 1,
+            &format!(
+                "Least productive: {} to {} ({})",
+                format_focus_time(summary.start_second),
+                format_focus_time(summary.end_second),
+                focus_level_label(summary.level)
+            ),
+            focus_level_color(summary.level),
+            None,
+            false,
+        );
     }
 }
 
@@ -2215,14 +2246,27 @@ fn current_background_focus_bias(state: &mut AppState) -> (f32, f32, f32) {
     if state.focus_level == FocusLevel::Focused {
         if let Some(loop_mix) = past_window_loop_mix(state) {
             return interpolate_bias(
-                focus_background_bias(FocusLevel::Focused),
-                focus_background_bias(FocusLevel::Broken),
+                MEMORY_LOOP_FOCUSED_BIAS,
+                MEMORY_LOOP_BROKEN_BIAS,
                 loop_mix,
             );
         }
     }
 
     live_bias
+}
+
+fn current_background_tint_alpha(state: &mut AppState) -> f32 {
+    let base_alpha = pomodoro_tint_alpha(state);
+    if state.focus_level != FocusLevel::Focused || state.focus_tint_started_at.is_some() {
+        return base_alpha;
+    }
+
+    if past_window_loop_mix(state).is_some() {
+        return (base_alpha + MEMORY_LOOP_ALPHA_BOOST).min(0.9);
+    }
+
+    base_alpha
 }
 
 fn toggle_pomodoro_session(state: &mut AppState) -> io::Result<()> {
@@ -2242,6 +2286,7 @@ fn start_pomodoro_session(state: &mut AppState) {
     set_focus_level(state, FocusLevel::Focused);
     state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
     state.last_focus_sample_second = None;
+    state.last_session_least_productive = None;
     state.pomodoro_start = Some(Local::now());
 }
 
@@ -2257,8 +2302,18 @@ fn stop_pomodoro_session(state: &mut AppState) -> io::Result<()> {
 
 fn stop_pomodoro_session_manually(state: &mut AppState) -> io::Result<()> {
     record_focus_sample(state);
-    if focus_elapsed_second(state.pomodoro_start).is_some_and(|second| second < 50 * 60) {
-        state.saved_focus_pattern = Some(SavedFocusPattern::FullWorkLoop);
+    state.last_session_least_productive =
+        least_productive_interval(&state.focus_samples).map(|(level, start_second, end_second)| {
+            LeastProductiveSummary {
+                level,
+                start_second,
+                end_second,
+            }
+        });
+    if let Some(second) = focus_elapsed_second(state.pomodoro_start).filter(|second| *second < 50 * 60) {
+        state.saved_focus_pattern = Some(SavedFocusPattern::RemainingWorkWindow {
+            start_second: second,
+        });
         save_focus_memory(state.saved_focus_pattern)?;
     }
     stop_pomodoro_session(state)
@@ -2266,6 +2321,14 @@ fn stop_pomodoro_session_manually(state: &mut AppState) -> io::Result<()> {
 
 fn complete_pomodoro_session(state: &mut AppState) -> io::Result<()> {
     record_focus_sample(state);
+    state.last_session_least_productive =
+        least_productive_interval(&state.focus_samples).map(|(level, start_second, end_second)| {
+            LeastProductiveSummary {
+                level,
+                start_second,
+                end_second,
+            }
+        });
     state.saved_focus_pattern =
         least_productive_interval(&state.focus_samples).map(|(_, start_second, end_second)| {
             SavedFocusPattern::LeastProductiveWindow(LeastProductiveWindow {
@@ -2327,22 +2390,27 @@ fn interpolate_scalar(from: f32, to: f32, progress: f32) -> f32 {
 
 fn past_window_loop_mix(state: &AppState) -> Option<f32> {
     let pattern = state.saved_focus_pattern?;
-    let current_second = focus_elapsed_second(state.pomodoro_start)?;
-
-    match pattern {
+    let start = state.pomodoro_start?;
+    let elapsed_seconds = Local::now().signed_duration_since(start).num_milliseconds() as f32 / 1_000.0;
+    if elapsed_seconds < 0.0 {
+        return None;
+    }
+    let current_second = elapsed_seconds.floor() as usize;
+    let loop_elapsed = match pattern {
         SavedFocusPattern::LeastProductiveWindow(window) => {
             if current_second < window.start_second || current_second >= window.end_second {
                 return None;
             }
+            elapsed_seconds - window.start_second as f32
         }
-        SavedFocusPattern::FullWorkLoop => {
-            if current_second >= 50 * 60 {
+        SavedFocusPattern::RemainingWorkWindow { start_second } => {
+            if current_second < start_second || current_second >= 50 * 60 {
                 return None;
             }
+            elapsed_seconds - start_second as f32
         }
-    }
-
-    let phase = Local::now().timestamp_millis() as f32 / 1_000.0 / PAST_WINDOW_LOOP_SECONDS;
+    };
+    let phase = loop_elapsed / PAST_WINDOW_LOOP_SECONDS;
     Some(0.5 - 0.5 * (2.0 * PI as f32 * phase).cos())
 }
 
@@ -2945,7 +3013,14 @@ fn load_focus_memory() -> io::Result<Option<SavedFocusPattern>> {
                 },
             ))
         }
-        Some(StoredSavedFocusPattern::FullWorkLoop) => Some(SavedFocusPattern::FullWorkLoop),
+        Some(StoredSavedFocusPattern::RemainingWorkWindow { start_second })
+            if start_second < 50 * 60 =>
+        {
+            Some(SavedFocusPattern::RemainingWorkWindow { start_second })
+        }
+        Some(StoredSavedFocusPattern::FullWorkLoop) => {
+            Some(SavedFocusPattern::RemainingWorkWindow { start_second: 0 })
+        }
         _ => stored.least_productive_window.and_then(|window| {
             if window.start_second < window.end_second && window.end_second <= FOCUS_TRACKER_SECONDS
             {
@@ -2971,7 +3046,9 @@ fn save_focus_memory(pattern: Option<SavedFocusPattern>) -> io::Result<()> {
                     end_second: window.end_second,
                 }
             }
-            SavedFocusPattern::FullWorkLoop => StoredSavedFocusPattern::FullWorkLoop,
+            SavedFocusPattern::RemainingWorkWindow { start_second } => {
+                StoredSavedFocusPattern::RemainingWorkWindow { start_second }
+            }
         }),
         least_productive_window: None,
     };
