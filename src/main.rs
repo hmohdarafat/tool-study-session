@@ -111,6 +111,8 @@ struct AppState {
     last_focus_sample_second: Option<usize>,
     last_session_least_productive: Option<LeastProductiveSummary>,
     saved_focus_pattern: Option<SavedFocusPattern>,
+    ignore_saved_focus_pattern_for_current_session: bool,
+    new_session_notice_started_at: Option<Instant>,
     selected_noise: Option<NoiseKind>,
     noise_volume: u8,
     noise_audio: NoiseAudio,
@@ -373,6 +375,8 @@ fn main() -> io::Result<()> {
         last_focus_sample_second: None,
         last_session_least_productive: None,
         saved_focus_pattern: load_focus_memory().ok().flatten(),
+        ignore_saved_focus_pattern_for_current_session: false,
+        new_session_notice_started_at: None,
         selected_noise: None,
         noise_volume: 50,
         noise_audio: NoiseAudio::new(),
@@ -447,6 +451,12 @@ fn run(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
                         KeyCode::Char('e') | KeyCode::Char('E') => {
                             save_editing_todo(state);
                             set_focus_level(state, FocusLevel::Broken);
+                            controls = render(stdout, state)?;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            save_editing_todo(state);
+                            state.ignore_saved_focus_pattern_for_current_session = true;
+                            state.new_session_notice_started_at = Some(Instant::now());
                             controls = render(stdout, state)?;
                         }
                         KeyCode::Char('-') => {
@@ -681,6 +691,8 @@ fn adjust_noise_volume(state: &mut AppState, delta: i16) {
 
 fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
     record_focus_sample(state);
+    let notice_visible = new_session_notice_visible(state);
+    let top_notice_rows: u16 = if notice_visible { 1 } else { 0 };
 
     let (mut width, mut height) = terminal::size()?;
     let preview_calendar = build_calendar_panel(
@@ -696,7 +708,9 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         state.last_session_least_productive,
         0,
     );
-    let minimum_height = (preview_calendar.grid.len() as u16).saturating_add(2);
+    let minimum_height = (preview_calendar.grid.len() as u16)
+        .saturating_add(2)
+        .saturating_add(top_notice_rows);
     if height < minimum_height {
         request_terminal_size(stdout, width, minimum_height)?;
         let (new_width, new_height) = terminal::size()?;
@@ -704,13 +718,13 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         height = new_height;
     }
 
-    let content_height = height.saturating_sub(2);
+    let content_height = height.saturating_sub(2 + top_notice_rows);
     let calendar_width = preview_calendar
         .grid
         .first()
         .map(|line| line.len() as u16)
         .unwrap_or(0);
-    let quit_hint = "Esc = quit  q/w/e = focus";
+    let quit_hint = "Esc = quit  q/w/e = focus  n = New session";
     let footer_width = quit_hint.len() as u16;
     let clock_header_rows: u16 = 2;
     if !state.window_fitted {
@@ -729,12 +743,12 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         height = new_height;
         state.window_fitted = true;
     }
-    let content_height = height.saturating_sub(2);
+    let content_height = height.saturating_sub(2 + top_notice_rows);
     let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
     let calendar_x = 0;
     let clock_x = calendar_x + calendar_width + PANEL_GAP;
-    let noise_y: u16 = 0;
-    let clock_y: u16 = 2;
+    let noise_y: u16 = top_notice_rows;
+    let clock_y: u16 = top_notice_rows.saturating_add(2);
     let start_label = if state.pomodoro_start.is_some() {
         "[Stop]"
     } else {
@@ -766,14 +780,15 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         .grid
         .len()
         .max((initial_status_countdown_y as usize).saturating_add(1))
-        .saturating_add(1) as u16;
+        .saturating_add(1) as u16
+        + top_notice_rows;
     if state.pending_height_fit && height != desired_height {
         request_terminal_size(stdout, width, desired_height)?;
         let (new_width, new_height) = terminal::size()?;
         width = new_width;
         height = new_height;
 
-        let content_height = height.saturating_sub(2);
+        let content_height = height.saturating_sub(2 + top_notice_rows);
         let available_clock_width = width.saturating_sub(calendar_width + PANEL_GAP);
         let available_clock_height = content_height.saturating_sub(clock_header_rows);
         clock = build_clock(
@@ -826,7 +841,7 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         &mut frame,
         &calendar.grid,
         calendar_x as usize,
-        0,
+        top_notice_rows as usize,
     );
     overlay_grid(&mut frame, &clock, clock_x as usize, clock_y as usize);
     let noise_controls = render_noise_buttons(
@@ -864,6 +879,19 @@ fn render(stdout: &mut Stdout, state: &mut AppState) -> io::Result<UiControls> {
         None,
         false,
     );
+    if notice_visible {
+        let notice = "New session created";
+        let notice_x = width.saturating_sub(notice.len() as u16) / 2;
+        write_text(
+            &mut frame,
+            notice_x as usize,
+            0,
+            notice,
+            TODO_HEADER_COLOR,
+            None,
+            false,
+        );
+    }
     if state.quit_prompt {
         write_text(
             &mut frame,
@@ -2308,6 +2336,7 @@ fn start_pomodoro_session(state: &mut AppState) {
     state.focus_samples = [None; FOCUS_TRACKER_SECONDS];
     state.last_focus_sample_second = None;
     state.last_session_least_productive = None;
+    state.ignore_saved_focus_pattern_for_current_session = false;
     state.pomodoro_start = Some(Local::now());
 }
 
@@ -2318,6 +2347,7 @@ fn stop_pomodoro_session(state: &mut AppState) -> io::Result<()> {
     state.pomodoro_tint_started_at = Some(Instant::now());
     state.pomodoro_start = None;
     state.last_focus_sample_second = None;
+    state.ignore_saved_focus_pattern_for_current_session = false;
     Ok(())
 }
 
@@ -2412,6 +2442,10 @@ fn interpolate_scalar(from: f32, to: f32, progress: f32) -> f32 {
 }
 
 fn past_window_loop_mix(state: &AppState) -> Option<f32> {
+    if state.ignore_saved_focus_pattern_for_current_session {
+        return None;
+    }
+
     let pattern = state.saved_focus_pattern.as_ref()?;
     let start = state.pomodoro_start?;
     let elapsed_seconds = Local::now().signed_duration_since(start).num_milliseconds() as f32 / 1_000.0;
@@ -2464,6 +2498,19 @@ fn memory_loop_handoff_progress(state: &mut AppState) -> f32 {
         1.0
     } else {
         ease_in_out_sine(progress)
+    }
+}
+
+fn new_session_notice_visible(state: &mut AppState) -> bool {
+    let Some(started_at) = state.new_session_notice_started_at else {
+        return false;
+    };
+
+    if started_at.elapsed() >= Duration::from_secs(3) {
+        state.new_session_notice_started_at = None;
+        false
+    } else {
+        true
     }
 }
 
